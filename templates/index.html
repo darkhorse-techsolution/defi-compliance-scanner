@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DeFi Compliance Risk Scanner | Dark Horse Solution</title>
+    <link rel="stylesheet" href="/static/style.css">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+</head>
+<body>
+    <div class="app">
+        <!-- Header -->
+        <header class="header">
+            <div class="header-content">
+                <div class="logo">
+                    <div class="logo-icon">
+                        <svg width="32" height="32" viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg">
+                            <rect width="32" height="32" rx="8" fill="#3b82f6"/>
+                            <path d="M8 16L14 22L24 10" stroke="white" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+                        </svg>
+                    </div>
+                    <div>
+                        <h1 class="logo-text">DeFi Compliance Scanner</h1>
+                        <p class="logo-subtitle">On-Chain Risk Intelligence</p>
+                    </div>
+                </div>
+                <div class="header-badge">
+                    <span class="badge">Prototype</span>
+                    <span class="badge badge-outline">Ethereum Mainnet</span>
+                </div>
+            </div>
+        </header>
+
+        <!-- Hero / Scanner -->
+        <section class="scanner-section">
+            <div class="scanner-container">
+                <h2 class="scanner-title">Scan any Ethereum address for compliance risk</h2>
+                <p class="scanner-description">
+                    OFAC sanctions screening, transaction pattern analysis, and AI-generated
+                    compliance reports -- powered by real-time on-chain data.
+                </p>
+
+                <div class="search-box">
+                    <input
+                        type="text"
+                        id="addressInput"
+                        class="address-input"
+                        placeholder="Enter Ethereum address (0x...)"
+                        spellcheck="false"
+                        autocomplete="off"
+                    >
+                    <button id="scanButton" class="scan-button" onclick="scanAddress()">
+                        <span class="button-text">Scan Address</span>
+                        <span class="button-loading" style="display:none;">
+                            <span class="spinner"></span>
+                            Analyzing...
+                        </span>
+                    </button>
+                </div>
+
+                <div class="demo-addresses" id="demoAddresses">
+                    <p class="demo-label">Try a demo address:</p>
+                    <div class="demo-buttons" id="demoButtons">
+                        <!-- Populated by JS -->
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- How It Works -->
+        <section class="pipeline-section" id="pipelineSection">
+            <h3 class="section-title">Three-Layer Compliance Pipeline</h3>
+            <div class="pipeline-grid">
+                <div class="pipeline-card">
+                    <div class="pipeline-number">1</div>
+                    <h4>Data Engineering</h4>
+                    <p>Ingest and normalize raw blockchain transactions from Ethereum mainnet.
+                       Transform messy API responses into structured, analysis-ready datasets.</p>
+                    <div class="tech-tags">
+                        <span class="tech-tag">Python</span>
+                        <span class="tech-tag">Pandas</span>
+                        <span class="tech-tag">Etherscan API</span>
+                        <span class="tech-tag">AsyncIO</span>
+                    </div>
+                </div>
+                <div class="pipeline-card">
+                    <div class="pipeline-number">2</div>
+                    <h4>Blockchain Analytics</h4>
+                    <p>Screen against OFAC sanctions list, detect suspicious transaction patterns,
+                       classify DeFi protocol interactions, and compute composite risk scores.</p>
+                    <div class="tech-tags">
+                        <span class="tech-tag">Risk Scoring</span>
+                        <span class="tech-tag">OFAC Screening</span>
+                        <span class="tech-tag">Pattern Detection</span>
+                        <span class="tech-tag">DeFi Classification</span>
+                    </div>
+                </div>
+                <div class="pipeline-card">
+                    <div class="pipeline-number">3</div>
+                    <h4>AI Intelligence</h4>
+                    <p>Generate professional compliance narratives with regulatory context.
+                       Actionable reports a compliance officer can use directly for KYC/AML.</p>
+                    <div class="tech-tags">
+                        <span class="tech-tag">Claude API</span>
+                        <span class="tech-tag">NLP</span>
+                        <span class="tech-tag">MiCA</span>
+                        <span class="tech-tag">GENIUS Act</span>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Error Display -->
+        <div class="error-banner" id="errorBanner" style="display:none;">
+            <p id="errorMessage"></p>
+        </div>
+
+        <!-- Results Section -->
+        <section class="results-section" id="resultsSection" style="display:none;">
+
+            <!-- Risk Score Card -->
+            <div class="risk-score-card" id="riskScoreCard">
+                <div class="risk-score-header">
+                    <h3>Risk Assessment</h3>
+                    <span class="analyzed-at" id="analyzedAt"></span>
+                </div>
+                <div class="risk-score-body">
+                    <div class="risk-gauge">
+                        <div class="risk-score-number" id="riskScoreNumber">0</div>
+                        <div class="risk-score-label" id="riskScoreLabel">SCANNING...</div>
+                        <div class="risk-meter">
+                            <div class="risk-meter-fill" id="riskMeterFill"></div>
+                        </div>
+                    </div>
+                    <div class="risk-recommendation" id="riskRecommendation"></div>
+                </div>
+            </div>
+
+            <!-- Statistics Grid -->
+            <div class="stats-grid" id="statsGrid">
+                <!-- Populated by JS -->
+            </div>
+
+            <!-- Findings -->
+            <div class="findings-section" id="findingsSection">
+                <h3 class="section-title">Findings</h3>
+
+                <div class="findings-group" id="sanctionsFindings">
+                    <h4 class="findings-group-title">Sanctions Screening</h4>
+                    <div class="findings-list" id="sanctionsList"></div>
+                </div>
+
+                <div class="findings-group" id="patternFindings">
+                    <h4 class="findings-group-title">Transaction Pattern Analysis</h4>
+                    <div class="findings-list" id="patternsList"></div>
+                </div>
+
+                <div class="findings-group" id="defiFindings">
+                    <h4 class="findings-group-title">DeFi Protocol Interactions</h4>
+                    <div class="findings-list" id="defiList"></div>
+                </div>
+            </div>
+
+            <!-- Regulatory Context -->
+            <div class="regulations-section" id="regulationsSection">
+                <h3 class="section-title">Applicable Regulations</h3>
+                <div class="regulations-grid" id="regulationsGrid"></div>
+            </div>
+
+            <!-- AI Narrative Report -->
+            <div class="narrative-section" id="narrativeSection">
+                <div class="narrative-header">
+                    <h3 class="section-title">AI-Generated Compliance Report</h3>
+                    <button class="copy-button" onclick="copyNarrative()">Copy Report</button>
+                </div>
+                <div class="narrative-content" id="narrativeContent"></div>
+            </div>
+        </section>
+
+        <!-- Footer -->
+        <footer class="footer">
+            <div class="footer-content">
+                <div class="footer-brand">
+                    <strong>Dark Horse Solution</strong>
+                    <p>Compliance Data Infrastructure for Crypto Firms</p>
+                </div>
+                <div class="footer-tech">
+                    <p>Built with: Python, FastAPI, Pandas, Etherscan API, Claude AI</p>
+                    <p class="footer-note">
+                        This is a portfolio prototype demonstrating data engineering + blockchain + AI.
+                        Not financial or legal advice.
+                    </p>
+                </div>
+            </div>
+        </footer>
+    </div>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>
