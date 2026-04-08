@@ -242,21 +242,43 @@ async def fetch_internal_transactions(
 async def fetch_first_transaction(address: str) -> Optional[dict]:
     """
     Return the earliest transaction record for the address (used to compute
-    address age). Sorted ascending so the first row is the oldest.
+    address age). Queries normal txs, internal txs, and ERC-20 transfers in
+    parallel with ascending sort, and picks the oldest timestamp across all
+    three. This catches contract wallets and cold wallets that may only
+    show up in one of the three lists.
     """
-    params = {
-        "module": "account",
-        "action": "txlist",
-        "address": address,
-        "startblock": "0",
-        "endblock": "99999999",
-        "page": "1",
-        "offset": "1",
-        "sort": "asc",
-    }
-    rows = await _etherscan_request(params) if _has_etherscan_key() \
-        else await _blockscout_request(params)
-    return rows[0] if rows else None
+    common = {"address": address, "startblock": "0", "endblock": "99999999",
+              "page": "1", "offset": "1", "sort": "asc"}
+
+    async def _first_of(action: str) -> Optional[dict]:
+        params = {"module": "account", "action": action, **common}
+        rows = await _etherscan_request(params) if _has_etherscan_key() \
+            else await _blockscout_request(params)
+        return rows[0] if rows else None
+
+    results = await asyncio.gather(
+        _first_of("txlist"),
+        _first_of("txlistinternal"),
+        _first_of("tokentx"),
+        return_exceptions=True,
+    )
+
+    earliest: Optional[dict] = None
+    earliest_ts: Optional[int] = None
+    for row in results:
+        if isinstance(row, Exception) or not row:
+            continue
+        ts_raw = row.get("timeStamp")
+        if not ts_raw:
+            continue
+        try:
+            ts = int(ts_raw)
+        except (TypeError, ValueError):
+            continue
+        if earliest_ts is None or ts < earliest_ts:
+            earliest = row
+            earliest_ts = ts
+    return earliest
 
 
 # =====================================================================
@@ -397,6 +419,14 @@ async def get_wallet_data(address: str) -> dict:
         earliest_tx = tx_df["datetime"].min()
         address_age_days = (datetime.now(timezone.utc) - earliest_tx).days
 
+    # Detect whether the result was truncated at the page limit. Both
+    # Etherscan and Blockscout cap txlist results; if we hit the cap we
+    # almost certainly missed older activity and should say so.
+    data_truncated = (
+        len(raw_txs) >= DEFAULT_PAGE_SIZE
+        or len(raw_tokens) >= DEFAULT_PAGE_SIZE
+    )
+
     return {
         "address": address,
         "balance": balance,
@@ -407,5 +437,7 @@ async def get_wallet_data(address: str) -> dict:
         "token_transfer_count": len(raw_tokens),
         "address_age_days": address_age_days,
         "data_source": active_data_source(),
+        "data_truncated": data_truncated,
+        "page_limit": DEFAULT_PAGE_SIZE,
         "errors": errors,
     }

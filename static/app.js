@@ -180,7 +180,7 @@
         els.resultsSection.hidden = false;
 
         renderRisk(data);
-        renderStats(data.statistics);
+        renderStats(data.statistics, data);
         renderActivityChart(data.statistics.timeline || []);
         renderRegulations(data.regulations_applicable || []);
         renderFindings(
@@ -256,10 +256,14 @@
         return "Low compliance risk";
     }
 
-    function renderStats(stats) {
+    function renderStats(stats, fullData) {
+        const truncated = fullData && fullData.data_truncated;
+        const pageLimit = (fullData && fullData.page_limit) || 200;
+
         els.statTransactions.textContent = formatInt(stats.total_transactions);
         els.statTransactionsSub.textContent =
-            (stats.total_token_transfers || 0).toLocaleString() + " token transfers";
+            (stats.total_token_transfers || 0).toLocaleString() + " token transfers" +
+            (truncated ? " (sample)" : "");
 
         const totalVolume = (stats.total_eth_sent || 0) + (stats.total_eth_received || 0);
         els.statVolume.textContent = formatEth(totalVolume);
@@ -278,6 +282,23 @@
         }
 
         els.statCounterparties.textContent = formatInt(stats.unique_counterparties);
+
+        // Show a data-completeness disclaimer when results were capped
+        let disclaimer = document.getElementById("dataSampleDisclaimer");
+        if (truncated) {
+            if (!disclaimer) {
+                disclaimer = document.createElement("div");
+                disclaimer.id = "dataSampleDisclaimer";
+                disclaimer.className = "data-disclaimer";
+                els.resultsSection.insertBefore(disclaimer, els.resultsSection.firstChild);
+            }
+            disclaimer.innerHTML =
+                "<strong>Note:</strong> Analysis based on the most recent " + pageLimit +
+                " transactions. This is a sample for a fast scan and may miss older activity. " +
+                "Address age is computed from a separate earliest-transaction lookup when available.";
+        } else if (disclaimer) {
+            disclaimer.remove();
+        }
     }
 
     function renderActivityChart(timeline) {

@@ -155,6 +155,11 @@ def analyze_transaction_patterns(wallet_data: dict) -> list[dict]:
             })
 
     # 3. Counterparty concentration analysis
+    #
+    # Concentration is benign when the top counterparty is a known DeFi
+    # protocol (Uniswap router, Aave pool, etc.) - that just means the
+    # wallet is an active user of one platform. It is a laundering red
+    # flag when the counterparty is unknown and concentration is very high.
     if not tx_df.empty:
         counterparties = tx_df["counterparty"].value_counts()
         total_txs = len(tx_df)
@@ -162,18 +167,39 @@ def analyze_transaction_patterns(wallet_data: dict) -> list[dict]:
             top_counterparty = counterparties.index[0]
             top_count = counterparties.iloc[0]
             concentration = top_count / total_txs
+            top_lower = top_counterparty.lower() if top_counterparty else ""
+            is_known_protocol = top_lower in KNOWN_PROTOCOLS
 
             if concentration > 0.5 and total_txs > 5:
-                label = KNOWN_PROTOCOLS.get(top_counterparty.lower(), top_counterparty[:10] + "...")
+                label = KNOWN_PROTOCOLS.get(top_lower, top_counterparty[:10] + "...")
+
+                if is_known_protocol:
+                    severity = "LOW"
+                    description = (
+                        f"{concentration:.0%} of transactions involve {label}. "
+                        f"Activity is concentrated but anchored in a recognized protocol."
+                    )
+                    score_multiplier = 0.5
+                elif concentration > 0.8:
+                    severity = "HIGH"
+                    description = (
+                        f"{concentration:.0%} of transactions involve a single unlabeled counterparty "
+                        f"({label}). Extreme concentration with an unknown party is a layering red flag."
+                    )
+                    score_multiplier = 2.0
+                else:
+                    severity = "MEDIUM"
+                    description = (
+                        f"{concentration:.0%} of transactions involve a single unlabeled counterparty "
+                        f"({label}). High concentration with an unknown party warrants review."
+                    )
+                    score_multiplier = 1.25
+
                 findings.append({
                     "type": "concentrated_counterparty",
-                    "severity": "LOW",
-                    "description": (
-                        f"{concentration:.0%} of transactions involve a single counterparty "
-                        f"({label}). High concentration may indicate "
-                        f"a business relationship or automated activity."
-                    ),
-                    "risk_score": RISK_WEIGHTS["concentrated_counterparty"] * concentration,
+                    "severity": severity,
+                    "description": description,
+                    "risk_score": RISK_WEIGHTS["concentrated_counterparty"] * concentration * score_multiplier,
                 })
 
     # 4. Address age check
@@ -390,6 +416,8 @@ def run_risk_analysis(wallet_data: dict) -> dict:
         "defi_interactions": defi_interactions,
         "statistics": statistics,
         "has_data": has_any_data,
+        "data_truncated": bool(wallet_data.get("data_truncated", False)),
+        "page_limit": wallet_data.get("page_limit"),
         "fetch_errors": wallet_data.get("errors", []),
         "analyzed_at": datetime.now(timezone.utc).isoformat(),
         "regulations_applicable": [
