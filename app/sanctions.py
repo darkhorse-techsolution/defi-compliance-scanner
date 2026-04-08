@@ -64,6 +64,7 @@ logger = logging.getLogger(__name__)
 _SANCTIONS_CACHE: set[str] = set()
 _SANCTIONS_UPDATED_AT: Optional[datetime] = None
 _SANCTIONS_SOURCE: str = "uninitialized"
+_SANCTIONS_SOURCE_COUNTS: dict[str, int] = {}
 _CACHE_TTL = timedelta(hours=24)
 
 # Single-flight lock so parallel scans triggered on cold start don't
@@ -73,11 +74,47 @@ _REFRESH_LOCK = asyncio.Lock()
 _CACHE_FILE = Path(__file__).resolve().parent.parent / "data" / "sanctions_cache.json"
 
 # Upstream URLs
-_GITHUB_LIST_URL = (
+#
+# The 0xB10C mirror publishes one file per chain. We pull every
+# chain/asset file and use them all - the final sanctions set is just
+# the union of everything we can reach. We key the dict by the chain
+# label so the health endpoint can report which upstream contributed
+# how much.
+_GITHUB_BASE = (
     "https://raw.githubusercontent.com/0xB10C/"
-    "ofac-sanctioned-digital-currency-addresses/lists/sanctioned_addresses_ETH.json"
+    "ofac-sanctioned-digital-currency-addresses/lists/"
 )
-_OFAC_SDN_XML_URL = "https://www.treasury.gov/ofac/downloads/sdn.xml"
+_GITHUB_LISTS = {
+    "ETH":  f"{_GITHUB_BASE}sanctioned_addresses_ETH.json",
+    "USDT": f"{_GITHUB_BASE}sanctioned_addresses_USDT.json",
+    "USDC": f"{_GITHUB_BASE}sanctioned_addresses_USDC.json",
+    "BSC":  f"{_GITHUB_BASE}sanctioned_addresses_BSC.json",
+    "ARB":  f"{_GITHUB_BASE}sanctioned_addresses_ARB.json",
+    "ETC":  f"{_GITHUB_BASE}sanctioned_addresses_ETC.json",
+    "TRX":  f"{_GITHUB_BASE}sanctioned_addresses_TRX.json",
+    "XBT":  f"{_GITHUB_BASE}sanctioned_addresses_XBT.json",
+    "BCH":  f"{_GITHUB_BASE}sanctioned_addresses_BCH.json",
+    "BSV":  f"{_GITHUB_BASE}sanctioned_addresses_BSV.json",
+    "BTG":  f"{_GITHUB_BASE}sanctioned_addresses_BTG.json",
+    "DASH": f"{_GITHUB_BASE}sanctioned_addresses_DASH.json",
+    "LTC":  f"{_GITHUB_BASE}sanctioned_addresses_LTC.json",
+    "XMR":  f"{_GITHUB_BASE}sanctioned_addresses_XMR.json",
+    "XRP":  f"{_GITHUB_BASE}sanctioned_addresses_XRP.json",
+    "XVG":  f"{_GITHUB_BASE}sanctioned_addresses_XVG.json",
+    "ZEC":  f"{_GITHUB_BASE}sanctioned_addresses_ZEC.json",
+}
+
+# Authoritative US Treasury feed. Parsed with a permissive regex that
+# picks up any 0x-prefixed 40-hex-char sequence from the XML body -
+# that catches every EVM-family address (ETH, USDT_ETH, USDC, BSC, ARB,
+# etc.) without having to parse the full SDN schema.
+_OFAC_SDN_XML_URL = (
+    "https://sanctionslistservice.ofac.treas.gov/api/publicationpreview/exports/sdn.xml"
+)
+
+# Per-address live lookup from Chainalysis. Free, no key required, used
+# as a belt-and-braces check on counterparties so anything added to the
+# official list after the last cache refresh still gets caught.
 _CHAINALYSIS_ORACLE_URL = "https://public.chainalysis.com/api/v1/address/{address}"
 
 _ETH_ADDRESS_RE = re.compile(r"0x[0-9a-fA-F]{40}")
@@ -88,15 +125,35 @@ _HTTP_TIMEOUT = 15.0
 # Helpers
 # =====================================================================
 
-def _normalize(addresses) -> set[str]:
-    """Lowercase, validate and dedupe an iterable of address strings."""
+def _normalize(addresses, evm_only: bool = False) -> set[str]:
+    """
+    Lowercase, dedupe, and minimally validate an iterable of address
+    strings. By default we accept any non-empty string that looks like
+    a plausible address (no whitespace, reasonable length) so the set
+    can hold Bitcoin, Monero, Tron and other non-EVM formats for future
+    multi-chain support. Set ``evm_only=True`` to restrict to 0x-hex
+    Ethereum addresses.
+    """
     out: set[str] = set()
     for raw in addresses or []:
         if not isinstance(raw, str):
             continue
-        candidate = raw.strip().lower()
-        if _ETH_ADDRESS_RE.fullmatch(candidate):
-            out.add(candidate)
+        candidate = raw.strip()
+        if not candidate:
+            continue
+        # Lowercase only the EVM 0x-prefixed hex addresses. Other chains
+        # use case-sensitive encodings (base58, bech32, etc.) so we must
+        # keep their casing intact.
+        if candidate.startswith("0x") or candidate.startswith("0X"):
+            candidate = candidate.lower()
+            if evm_only and not _ETH_ADDRESS_RE.fullmatch(candidate):
+                continue
+        elif evm_only:
+            continue
+        # Sanity: skip anything obviously not an address
+        if len(candidate) < 26 or len(candidate) > 128 or " " in candidate:
+            continue
+        out.add(candidate)
     return out
 
 
@@ -139,87 +196,145 @@ def _load_cache() -> Optional[tuple[set[str], datetime, str]]:
 # Upstream fetchers
 # =====================================================================
 
-async def _fetch_github_list() -> set[str]:
-    """Fetch the 0xB10C mirror of the OFAC ETH address list."""
-    async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as client:
-        resp = await client.get(_GITHUB_LIST_URL)
+async def _fetch_github_chain(client: httpx.AsyncClient, label: str, url: str) -> tuple[str, set[str]]:
+    """
+    Pull a single 0xB10C chain-specific sanctions file. Returns the chain
+    label plus whatever addresses we could parse. Failures are logged and
+    return an empty set so one broken file cannot take down the refresh.
+    Non-EVM chains (BTC, XMR, TRX, etc.) go through the permissive
+    normalizer so their base58/bech32 addresses still land in the cache.
+    """
+    try:
+        resp = await client.get(url)
         resp.raise_for_status()
         data = resp.json()
-    return _normalize(data)
+    except (httpx.HTTPError, ValueError) as exc:
+        logger.warning("github list %s unavailable: %s", label, exc)
+        return label, set()
+    return label, _normalize(data)
+
+
+async def _fetch_all_github_lists() -> dict[str, set[str]]:
+    """
+    Pull every 0xB10C chain file in parallel and return a dict keyed by
+    chain label. Only non-empty results are included.
+    """
+    async with httpx.AsyncClient(
+        timeout=_HTTP_TIMEOUT,
+        follow_redirects=True,
+    ) as client:
+        tasks = [
+            _fetch_github_chain(client, label, url)
+            for label, url in _GITHUB_LISTS.items()
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    out: dict[str, set[str]] = {}
+    for entry in results:
+        if isinstance(entry, Exception):
+            continue
+        label, addresses = entry
+        if addresses:
+            out[label] = addresses
+    return out
 
 
 async def _fetch_treasury_sdn() -> set[str]:
     """
-    Fetch and parse the authoritative Treasury SDN XML.
+    Fetch and parse the authoritative Treasury SDN XML feed.
 
     We do not use a full XML parser here - the SDN is large and only
-    a tiny fraction of it is crypto addresses. A regex over the
-    DigitalCurrencyAddress block is both faster and avoids pulling in
-    lxml. This is defensive enough for a fallback source.
+    a tiny fraction of it is crypto addresses. A regex over the body
+    picks out anything that looks like a 0x-prefixed EVM address, and
+    the feed happens to tag crypto wallets inline with their asset
+    label so a simple pattern match is robust enough for a fallback
+    source. The client follows the 302 redirect that Treasury now
+    returns from the legacy download URL.
     """
-    async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT * 2) as client:
+    async with httpx.AsyncClient(
+        timeout=_HTTP_TIMEOUT * 2,
+        follow_redirects=True,
+    ) as client:
         resp = await client.get(_OFAC_SDN_XML_URL)
         resp.raise_for_status()
         body = resp.text
     matches = _ETH_ADDRESS_RE.findall(body)
-    return _normalize(matches)
+    return _normalize(matches, evm_only=True)
 
 
 # =====================================================================
 # Live loader with fallback chain
 # =====================================================================
 
-async def _load_fresh_list() -> tuple[set[str], str]:
+async def _load_fresh_list() -> tuple[set[str], str, dict[str, int]]:
     """
-    Run the upstream fetchers in priority order, merging every source
-    we can reach. The hardcoded fallback is ALWAYS included so the
-    handful of high-confidence addresses we ship with never drop out
-    of the cache, even when an upstream omits them.
+    Pull every upstream list we know about in parallel and merge the
+    results. The hardcoded baseline is always folded in so high-
+    confidence addresses never drop out of the cache even if an
+    upstream omits them.
+
+    Returns a tuple of (merged_set, composite_source_label, per_source_counts).
+    The per-source counts are surfaced via /api/health so operators can
+    see exactly which lists contributed to the cache at any moment.
     """
     merged: set[str] = set()
     sources: list[str] = []
+    source_counts: dict[str, int] = {}
 
-    # 1. GitHub mirror (preferred - fast, machine-readable)
-    try:
-        addresses = await _fetch_github_list()
-        if addresses:
+    # Fire both upstream groups at the same time. If one is slow or
+    # down, the other still populates the cache.
+    github_task = _fetch_all_github_lists()
+    treasury_task = _fetch_treasury_sdn()
+    github_result, treasury_result = await asyncio.gather(
+        github_task, treasury_task, return_exceptions=True,
+    )
+
+    # 1. 0xB10C GitHub lists, one per chain
+    if isinstance(github_result, dict) and github_result:
+        for label, addresses in github_result.items():
+            new_rows = addresses - merged
             merged |= addresses
-            sources.append("github_0xb10c")
-    except (httpx.HTTPError, ValueError) as exc:
-        logger.warning("github sanctions list unavailable: %s", exc)
+            if new_rows:
+                key = f"github_{label.lower()}"
+                source_counts[key] = len(new_rows)
+                sources.append(key)
+    elif isinstance(github_result, Exception):
+        logger.warning("github sanctions fetch failed: %s", github_result)
 
-    # 2. Treasury SDN XML (authoritative but heavier). Fetch only if
-    #    the GitHub mirror came back empty - the Treasury parse is
-    #    expensive and the two lists overlap almost completely.
-    if not merged:
-        try:
-            addresses = await _fetch_treasury_sdn()
-            if addresses:
-                merged |= addresses
-                sources.append("treasury_sdn_xml")
-        except (httpx.HTTPError, ValueError) as exc:
-            logger.warning("treasury SDN feed unavailable: %s", exc)
+    # 2. Treasury SDN XML - authoritative, and covers EVM chains not
+    #    represented in the 0xB10C mirror
+    if isinstance(treasury_result, set) and treasury_result:
+        new_rows = treasury_result - merged
+        merged |= treasury_result
+        if new_rows:
+            source_counts["treasury_sdn_xml"] = len(new_rows)
+            sources.append("treasury_sdn_xml")
+    elif isinstance(treasury_result, Exception):
+        logger.warning("treasury SDN fetch failed: %s", treasury_result)
 
-    # 3. Disk cache from a previous successful fetch
+    # 3. Disk cache from a previous successful fetch (only if the live
+    #    sources gave us nothing at all)
     if not merged:
         cached = _load_cache()
         if cached:
             merged |= cached[0]
             sources.append(cached[2])
+            source_counts["disk_cache"] = len(cached[0])
 
-    # 4. Hardcoded high-confidence list - always merged in so well-
-    #    known Tornado Cash routers etc. are never missing from the set.
+    # 4. Hardcoded high-confidence list - always merged so well-known
+    #    Tornado Cash routers, Lazarus wallets, and Ronin exploiters
+    #    can never be missing from the set.
     fallback = _normalize(FALLBACK_ADDRESSES)
     new_from_fallback = fallback - merged
     merged |= fallback
     if new_from_fallback:
         sources.append("hardcoded_baseline")
+        source_counts["hardcoded_baseline"] = len(new_from_fallback)
 
     if not sources:
-        # Nothing at all worked, not even the fallback. Report it clearly.
-        return merged, "empty"
+        return merged, "empty", source_counts
 
-    return merged, "+".join(sources)
+    return merged, "+".join(sources), source_counts
 
 
 # =====================================================================
@@ -231,7 +346,7 @@ async def refresh_sanctions_list(force: bool = False) -> set[str]:
     Refresh the in-memory cache. Safe to call from multiple coroutines
     concurrently - only one refresh runs at a time thanks to the lock.
     """
-    global _SANCTIONS_CACHE, _SANCTIONS_UPDATED_AT, _SANCTIONS_SOURCE
+    global _SANCTIONS_CACHE, _SANCTIONS_UPDATED_AT, _SANCTIONS_SOURCE, _SANCTIONS_SOURCE_COUNTS
 
     async with _REFRESH_LOCK:
         now = datetime.now(timezone.utc)
@@ -243,7 +358,7 @@ async def refresh_sanctions_list(force: bool = False) -> set[str]:
         if fresh and not force:
             return _SANCTIONS_CACHE
 
-        addresses, source = await _load_fresh_list()
+        addresses, source, counts = await _load_fresh_list()
         if not addresses:
             # Nothing usable came back. Keep whatever we had.
             return _SANCTIONS_CACHE
@@ -251,13 +366,14 @@ async def refresh_sanctions_list(force: bool = False) -> set[str]:
         _SANCTIONS_CACHE = addresses
         _SANCTIONS_UPDATED_AT = now
         _SANCTIONS_SOURCE = source
+        _SANCTIONS_SOURCE_COUNTS = counts
 
         # Only persist lists that actually came off the wire. If the
         # only source we could reach was the hardcoded baseline the
         # disk cache would get poisoned with a permanent minimal set.
         came_from_network = any(
-            s in source
-            for s in ("github_0xb10c", "treasury_sdn_xml")
+            s.startswith("github_") or s == "treasury_sdn_xml"
+            for s in source.split("+")
         )
         if came_from_network:
             _save_cache(addresses, source)
@@ -287,17 +403,25 @@ async def is_address_sanctioned(address: str) -> bool:
 
 async def check_chainalysis_oracle(address: str) -> bool:
     """
-    Query the free Chainalysis public sanctions API for a single
-    address. Returns True if Chainalysis has identified the address as
-    sanctioned. Used as a secondary live check alongside the cached
-    list so additions made between cache refreshes are still caught.
+    Query the Chainalysis public sanctions API for a single address.
+
+    As of 2026-04 Chainalysis requires an ``X-API-Key`` header on every
+    request even for the free-tier sanctions oracle (5000 req / 5 min).
+    When the key is missing we skip the call entirely rather than pay
+    the round-trip cost of a Cloudflare-challenged request. The key is
+    read from ``CHAINALYSIS_API_KEY`` and is completely optional - the
+    scanner still works without it, falling back on the cached lists.
     """
-    if not address:
+    import os
+
+    api_key = os.getenv("CHAINALYSIS_API_KEY", "").strip()
+    if not api_key or not address:
         return False
+
     url = _CHAINALYSIS_ORACLE_URL.format(address=address)
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(url)
+            resp = await client.get(url, headers={"X-API-Key": api_key})
             if resp.status_code != 200:
                 return False
             data = resp.json()
@@ -306,11 +430,47 @@ async def check_chainalysis_oracle(address: str) -> bool:
     return bool(data.get("identifications"))
 
 
+def chainalysis_oracle_available() -> bool:
+    """True when a Chainalysis API key is configured for oracle lookups."""
+    import os
+    return bool(os.getenv("CHAINALYSIS_API_KEY", "").strip())
+
+
+async def batch_check_chainalysis_oracle(
+    addresses: list[str],
+    max_concurrent: int = 5,
+) -> set[str]:
+    """
+    Run the Chainalysis oracle against a batch of addresses with a
+    bounded concurrency ceiling. Returns the set of addresses the
+    oracle marked as sanctioned.
+
+    This is intentionally capped - the oracle is free but shared, and
+    scanning every counterparty of a whale wallet would hammer it. The
+    caller should pre-filter to the highest-signal addresses (e.g. the
+    top N counterparties by volume) before asking for a batch check.
+    """
+    if not addresses:
+        return set()
+
+    semaphore = asyncio.Semaphore(max_concurrent)
+    hits: set[str] = set()
+
+    async def _guarded(addr: str) -> None:
+        async with semaphore:
+            if await check_chainalysis_oracle(addr):
+                hits.add(addr.lower())
+
+    await asyncio.gather(*(_guarded(a) for a in addresses), return_exceptions=True)
+    return hits
+
+
 def sanctions_status() -> dict:
     """Expose cache metadata for the /api/health endpoint."""
     return {
         "size": len(_SANCTIONS_CACHE),
         "source": _SANCTIONS_SOURCE,
+        "source_breakdown": dict(_SANCTIONS_SOURCE_COUNTS),
         "updated_at": (
             _SANCTIONS_UPDATED_AT.isoformat()
             if _SANCTIONS_UPDATED_AT else None

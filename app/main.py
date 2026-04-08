@@ -25,7 +25,13 @@ from app.ai_narrative import generate_ai_narrative, has_anthropic_key
 from app.blockchain import DEPTH_PRESETS, active_data_source, get_wallet_data
 from app.config import ETHERSCAN_API_KEY
 from app.risk_engine import run_risk_analysis
-from app.sanctions import get_sanctioned_addresses, sanctions_status
+from app.sanctions import (
+    batch_check_chainalysis_oracle,
+    chainalysis_oracle_available,
+    check_chainalysis_oracle,
+    get_sanctioned_addresses,
+    sanctions_status,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +66,60 @@ ETH_ADDRESS_REGEX = re.compile(r"^0x[0-9a-fA-F]{40}$")
 
 def _has_etherscan_key() -> bool:
     return bool(ETHERSCAN_API_KEY) and ETHERSCAN_API_KEY != "your_etherscan_api_key_here"
+
+
+async def _oracle_check_top_counterparties(
+    address: str,
+    wallet_data: dict,
+    max_counterparties: int = 10,
+) -> set[str]:
+    """
+    Hit the Chainalysis public sanctions oracle for (1) the scanned
+    address itself and (2) the top N counterparties by transaction
+    count. Any hits are merged into the live sanctions cache used by
+    the risk engine so they get flagged as full CRITICAL findings
+    during analysis.
+
+    Returns the set of addresses the oracle confirmed as sanctioned.
+    """
+    from app.sanctions import _SANCTIONS_CACHE  # local import to avoid cycle
+
+    candidates: list[str] = [address.lower()]
+
+    tx_df = wallet_data.get("transactions")
+    try:
+        import pandas as pd  # noqa: WPS433 - fine inside a function
+        if hasattr(tx_df, "empty") and not tx_df.empty:
+            top = (
+                tx_df["counterparty"]
+                .dropna()
+                .astype(str)
+                .str.lower()
+                .value_counts()
+                .head(max_counterparties)
+                .index.tolist()
+            )
+            for cp in top:
+                if cp and cp not in candidates:
+                    candidates.append(cp)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("counterparty extraction failed: %s", exc)
+
+    if not candidates:
+        return set()
+
+    try:
+        hits = await batch_check_chainalysis_oracle(candidates, max_concurrent=5)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("chainalysis oracle batch check failed: %s", exc)
+        return set()
+
+    if hits:
+        # Merge the hits into the risk-engine-visible cache so the
+        # synchronous screen_sanctions call picks them up on this scan.
+        _SANCTIONS_CACHE.update(hits)
+
+    return hits
 
 
 def _resolve_depth(value) -> tuple[str, int]:
@@ -110,7 +170,9 @@ async def health():
         "anthropic_api_key": "configured" if has_anthropic_key() else "not_configured",
         "sanctions_list_size": status["size"],
         "sanctions_source": status["source"],
+        "sanctions_source_breakdown": status.get("source_breakdown", {}),
         "sanctions_updated_at": status["updated_at"],
+        "chainalysis_oracle": "enabled" if chainalysis_oracle_available() else "disabled",
         "depth_presets": DEPTH_PRESETS,
     }
 
@@ -153,7 +215,20 @@ async def scan_address(request: Request):
         await get_sanctioned_addresses()
 
         wallet_data = await get_wallet_data(address, max_results=max_results)
+
+        # Defence in depth: run the Chainalysis public oracle against
+        # the scanned address and the top N counterparties by volume.
+        # Any oracle hits get merged into the in-memory sanctions set
+        # before the risk engine walks the transaction list, so an
+        # address added between cache refreshes is still caught. This
+        # is a no-op when no CHAINALYSIS_API_KEY is configured.
+        oracle_hits: set[str] = set()
+        if chainalysis_oracle_available():
+            oracle_hits = await _oracle_check_top_counterparties(address, wallet_data)
+
         analysis = run_risk_analysis(wallet_data)
+        if oracle_hits:
+            analysis["oracle_hits"] = sorted(oracle_hits)
         narrative, narrative_source = await generate_ai_narrative(analysis)
         analysis["narrative"] = narrative
         analysis["narrative_source"] = narrative_source
