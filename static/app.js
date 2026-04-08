@@ -1,394 +1,538 @@
-/**
- * DeFi Compliance Scanner -- Frontend Application
- * Handles user interaction, API calls, and result rendering.
+/*
+ * ComplianceNode Scanner - frontend application
+ *
+ * Vanilla JS, no build step. Drives the scan form, renders the results
+ * dashboard, and toggles the dark/light theme.
  */
 
-// ---- State ----
-let currentResults = null;
+(function () {
+    "use strict";
 
-// ---- Initialization ----
-document.addEventListener("DOMContentLoaded", () => {
-    loadDemoAddresses();
+    // ---- DOM helpers -----------------------------------------------------
+    const $ = (id) => document.getElementById(id);
 
-    // Allow Enter key to trigger scan
-    document.getElementById("addressInput").addEventListener("keydown", (e) => {
-        if (e.key === "Enter") scanAddress();
+    const els = {};
+    let activityChart = null;
+    let currentResults = null;
+
+    // ---- Boot ------------------------------------------------------------
+    document.addEventListener("DOMContentLoaded", function () {
+        cacheEls();
+        loadTheme();
+        bindEvents();
+        loadExampleAddresses();
     });
-});
 
-async function loadDemoAddresses() {
-    try {
-        const resp = await fetch("/api/demo-addresses");
-        const data = await resp.json();
-        const container = document.getElementById("demoButtons");
+    function cacheEls() {
+        const ids = [
+            "scanForm", "addressInput", "scanButton", "scanHint",
+            "exampleChips", "errorBanner", "errorTitle", "errorMessage",
+            "loadingSkeleton", "resultsSection",
+            "riskGaugeFill", "riskScoreNumber", "riskLevelPill",
+            "riskFindingCount", "riskHeadline", "riskRecommendation",
+            "addressDisplay", "copyAddressBtn",
+            "dataSourceTag", "analyzedAtTag",
+            "statTransactions", "statTransactionsSub",
+            "statVolume", "statAge", "statAgeSub", "statCounterparties",
+            "activityChart", "chartEmpty", "regList",
+            "findingsSub", "sanctionsList", "patternsList", "defiList",
+            "narrativeContent", "copyNarrativeBtn",
+            "themeToggle", "themeToggleIcon",
+        ];
+        ids.forEach((id) => { els[id] = $(id); });
+    }
 
-        data.addresses.forEach((addr) => {
-            const btn = document.createElement("button");
-            btn.className = "demo-btn";
+    function bindEvents() {
+        els.scanForm.addEventListener("submit", function (e) {
+            e.preventDefault();
+            scanAddress();
+        });
 
-            const riskClass = addr.expected_risk.toLowerCase().includes("critical")
-                ? "demo-risk-critical"
-                : addr.expected_risk.toLowerCase().includes("medium")
-                ? "demo-risk-medium"
-                : "demo-risk-low";
+        els.themeToggle.addEventListener("click", toggleTheme);
 
-            btn.innerHTML = `${addr.label}<span class="demo-risk ${riskClass}">${addr.expected_risk}</span>`;
-            btn.title = addr.description;
-            btn.onclick = () => {
-                document.getElementById("addressInput").value = addr.address;
-                scanAddress();
+        els.copyAddressBtn.addEventListener("click", function () {
+            if (!currentResults) return;
+            copyText(currentResults.address, els.copyAddressBtn, "Copy");
+        });
+
+        els.copyNarrativeBtn.addEventListener("click", function () {
+            if (!currentResults || !currentResults.narrative) return;
+            copyText(currentResults.narrative, els.copyNarrativeBtn, "Copy report");
+        });
+    }
+
+    // ---- Theme -----------------------------------------------------------
+    function loadTheme() {
+        let stored = null;
+        try { stored = localStorage.getItem("cn-theme"); } catch (e) { /* ignore */ }
+        const theme = stored === "light" ? "light" : "dark";
+        applyTheme(theme);
+    }
+
+    function applyTheme(theme) {
+        document.documentElement.setAttribute("data-theme", theme);
+        els.themeToggleIcon.textContent = theme === "dark" ? "Dark" : "Light";
+        try { localStorage.setItem("cn-theme", theme); } catch (e) { /* ignore */ }
+
+        // If a chart exists, re-render so its colors pick up the new tokens
+        if (activityChart && currentResults) {
+            renderActivityChart(currentResults.statistics.timeline || []);
+        }
+    }
+
+    function toggleTheme() {
+        const current = document.documentElement.getAttribute("data-theme");
+        applyTheme(current === "dark" ? "light" : "dark");
+    }
+
+    // ---- Example chips ---------------------------------------------------
+    async function loadExampleAddresses() {
+        try {
+            const resp = await fetch("/api/example-addresses");
+            const data = await resp.json();
+            const container = els.exampleChips;
+            container.innerHTML = "";
+
+            data.addresses.forEach((addr) => {
+                const chip = document.createElement("button");
+                chip.type = "button";
+                chip.className = "example-chip";
+                chip.title = addr.description;
+
+                const pillClass = riskPillClass(addr.expected_risk);
+                chip.innerHTML =
+                    `<span>${escapeHtml(addr.label)}</span>` +
+                    `<span class="example-chip-pill ${pillClass}">${escapeHtml(addr.expected_risk)}</span>`;
+
+                chip.addEventListener("click", function () {
+                    els.addressInput.value = addr.address;
+                    scanAddress();
+                });
+                container.appendChild(chip);
+            });
+        } catch (e) {
+            console.warn("Could not load example addresses:", e);
+        }
+    }
+
+    function riskPillClass(risk) {
+        const r = (risk || "").toLowerCase();
+        if (r.includes("critical")) return "pill-critical";
+        if (r.includes("high")) return "pill-high";
+        if (r.includes("medium")) return "pill-medium";
+        return "pill-low";
+    }
+
+    // ---- Scan ------------------------------------------------------------
+    async function scanAddress() {
+        const address = (els.addressInput.value || "").trim();
+        if (!address) {
+            showError("Empty address", "Please paste an Ethereum address into the box.");
+            return;
+        }
+        if (!/^0x[0-9a-fA-F]{40}$/.test(address)) {
+            showError(
+                "Invalid address format",
+                "An Ethereum address must start with 0x and have exactly 40 hexadecimal characters."
+            );
+            return;
+        }
+
+        setLoading(true);
+        hideError();
+        els.resultsSection.hidden = true;
+        els.loadingSkeleton.hidden = false;
+
+        try {
+            const resp = await fetch("/api/scan", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ address: address }),
+            });
+
+            if (!resp.ok) {
+                let detail = "Scan failed.";
+                try {
+                    const err = await resp.json();
+                    detail = err.detail || detail;
+                } catch (e) { /* ignore */ }
+                throw new Error(detail);
+            }
+
+            const results = await resp.json();
+            currentResults = results;
+            renderResults(results);
+        } catch (e) {
+            showError("Scan failed", e.message || String(e));
+        } finally {
+            setLoading(false);
+            els.loadingSkeleton.hidden = true;
+        }
+    }
+
+    function setLoading(isLoading) {
+        els.scanButton.disabled = isLoading;
+        els.scanButton.classList.toggle("is-loading", isLoading);
+    }
+
+    // ---- Render results --------------------------------------------------
+    function renderResults(data) {
+        els.resultsSection.hidden = false;
+
+        renderRisk(data);
+        renderStats(data.statistics);
+        renderActivityChart(data.statistics.timeline || []);
+        renderRegulations(data.regulations_applicable || []);
+        renderFindings(
+            data.sanctions_findings || [],
+            data.pattern_findings || [],
+            data.defi_interactions || {}
+        );
+        renderNarrative(data.narrative);
+
+        // Empty-state hint when no upstream data was returned
+        if (data.has_data === false) {
+            const errs = (data.fetch_errors || []).join(" / ");
+            const msg = errs
+                ? `No on-chain activity returned. Upstream errors: ${errs}`
+                : "No transactions were found for this address. The wallet may be brand new or unused.";
+            showError("Limited data", msg);
+        }
+
+        setTimeout(function () {
+            els.resultsSection.scrollIntoView({ behavior: "smooth", block: "start" });
+        }, 80);
+    }
+
+    function renderRisk(data) {
+        const risk = data.risk_score;
+        const score = clamp(Number(risk.score) || 0, 0, 100);
+
+        // Animated number
+        animateNumber(els.riskScoreNumber, 0, score, 900);
+
+        // Gauge color + fill
+        const color = colorForLevel(risk.level, score);
+        const circumference = 2 * Math.PI * 84; // r=84
+        const offset = circumference * (1 - score / 100);
+        // Defer the dashoffset so the transition runs after layout settles
+        requestAnimationFrame(function () {
+            els.riskGaugeFill.style.stroke = color;
+            els.riskGaugeFill.style.strokeDashoffset = String(offset);
+        });
+
+        els.riskLevelPill.textContent = risk.level;
+        els.riskLevelPill.setAttribute("data-level", risk.level);
+
+        els.riskFindingCount.textContent =
+            risk.finding_count + (risk.finding_count === 1 ? " finding" : " findings");
+
+        els.riskHeadline.textContent = headlineForLevel(risk.level);
+        els.riskRecommendation.textContent = risk.recommendation || "";
+
+        els.addressDisplay.textContent = truncateAddress(data.address);
+
+        const sourceLabel = data.data_source === "etherscan_v2"
+            ? "Source: Etherscan V2"
+            : "Source: Blockscout (free)";
+        els.dataSourceTag.textContent = sourceLabel;
+
+        const analyzed = new Date(data.analyzed_at);
+        els.analyzedAtTag.textContent = "Analyzed " + analyzed.toLocaleString();
+    }
+
+    function colorForLevel(level, score) {
+        if (level === "CRITICAL" || score >= 91) return "#ef4444";
+        if (level === "HIGH" || score >= 61) return "#f97316";
+        if (score >= 31) return "#f59e0b";
+        return "#10b981";
+    }
+
+    function headlineForLevel(level) {
+        if (level === "CRITICAL") return "Critical compliance risk";
+        if (level === "HIGH") return "Elevated compliance risk";
+        if (level === "MEDIUM") return "Moderate compliance risk";
+        if (level === "MEDIUM-LOW") return "Minor compliance flags";
+        return "Low compliance risk";
+    }
+
+    function renderStats(stats) {
+        els.statTransactions.textContent = formatInt(stats.total_transactions);
+        els.statTransactionsSub.textContent =
+            (stats.total_token_transfers || 0).toLocaleString() + " token transfers";
+
+        const totalVolume = (stats.total_eth_sent || 0) + (stats.total_eth_received || 0);
+        els.statVolume.textContent = formatEth(totalVolume);
+
+        const ageDays = stats.address_age_days;
+        if (ageDays === null || ageDays === undefined) {
+            els.statAge.textContent = "N/A";
+            els.statAgeSub.textContent = "no transaction history";
+        } else if (ageDays >= 365) {
+            const years = (ageDays / 365);
+            els.statAge.textContent = years.toFixed(1) + " yr";
+            els.statAgeSub.textContent = formatInt(ageDays) + " days since first tx";
+        } else {
+            els.statAge.textContent = formatInt(ageDays);
+            els.statAgeSub.textContent = ageDays === 1 ? "day old" : "days old";
+        }
+
+        els.statCounterparties.textContent = formatInt(stats.unique_counterparties);
+    }
+
+    function renderActivityChart(timeline) {
+        const ctx = els.activityChart.getContext("2d");
+
+        if (!timeline || timeline.length === 0) {
+            els.chartEmpty.hidden = false;
+            els.activityChart.style.display = "none";
+            if (activityChart) { activityChart.destroy(); activityChart = null; }
+            return;
+        }
+        els.chartEmpty.hidden = true;
+        els.activityChart.style.display = "block";
+
+        const labels = timeline.map(function (p) { return p.date; });
+        const counts = timeline.map(function (p) { return p.count; });
+
+        const cs = getComputedStyle(document.documentElement);
+        const primary = cs.getPropertyValue("--primary").trim() || "#2563eb";
+        const text = cs.getPropertyValue("--text-muted").trim() || "#94a3b8";
+        const grid = cs.getPropertyValue("--border").trim() || "rgba(255,255,255,0.08)";
+
+        if (activityChart) { activityChart.destroy(); }
+
+        if (typeof Chart === "undefined") {
+            // Chart.js still loading - try again shortly
+            setTimeout(function () { renderActivityChart(timeline); }, 200);
+            return;
+        }
+
+        activityChart = new Chart(ctx, {
+            type: "bar",
+            data: {
+                labels: labels,
+                datasets: [{
+                    label: "Transactions",
+                    data: counts,
+                    backgroundColor: primary,
+                    borderRadius: 4,
+                    barThickness: "flex",
+                    maxBarThickness: 14,
+                }],
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                plugins: {
+                    legend: { display: false },
+                    tooltip: {
+                        backgroundColor: "rgba(15, 22, 38, 0.95)",
+                        titleColor: "#f8fafc",
+                        bodyColor: "#cbd5e1",
+                        padding: 10,
+                        cornerRadius: 6,
+                    },
+                },
+                scales: {
+                    x: {
+                        ticks: { color: text, font: { size: 10 }, maxRotation: 0, autoSkip: true, maxTicksLimit: 8 },
+                        grid: { display: false },
+                    },
+                    y: {
+                        ticks: { color: text, font: { size: 10 }, precision: 0 },
+                        grid: { color: grid },
+                        beginAtZero: true,
+                    },
+                },
+            },
+        });
+    }
+
+    function renderRegulations(regs) {
+        els.regList.innerHTML = "";
+        if (!regs.length) {
+            const li = document.createElement("li");
+            li.className = "finding-empty";
+            li.textContent = "No regulatory frameworks listed.";
+            els.regList.appendChild(li);
+            return;
+        }
+        regs.forEach(function (reg) {
+            const li = document.createElement("li");
+            li.className = "reg-list-item";
+            li.innerHTML =
+                `<span class="reg-list-name">${escapeHtml(reg.name)}</span>` +
+                `<span class="reg-list-deadline">Deadline: ${escapeHtml(reg.deadline)}</span>` +
+                `<span class="reg-list-relevance">${escapeHtml(reg.relevance)}</span>`;
+            els.regList.appendChild(li);
+        });
+    }
+
+    function renderFindings(sanctions, patterns, defi) {
+        const totalFindings =
+            sanctions.length + patterns.length + Object.keys(defi).length;
+        els.findingsSub.textContent =
+            totalFindings + (totalFindings === 1 ? " item" : " items");
+
+        renderFindingList(els.sanctionsList, sanctions, "info",
+            "No sanctions exposure detected. Address is not on the OFAC SDN list and no counterparties match sanctioned entities.");
+
+        renderFindingList(els.patternsList, patterns, "info",
+            "No suspicious transaction patterns detected in the analyzed dataset.");
+
+        // DeFi interactions are rendered as info-level items
+        const defiArray = Object.entries(defi).map(function (entry) {
+            const name = entry[0];
+            const info = entry[1];
+            return {
+                severity: "INFO",
+                title: name,
+                description: info.count + " interaction" + (info.count === 1 ? "" : "s"),
             };
-            container.appendChild(btn);
         });
-    } catch (e) {
-        console.error("Failed to load demo addresses:", e);
-    }
-}
-
-// ---- Main Scan Function ----
-async function scanAddress() {
-    const input = document.getElementById("addressInput");
-    const address = input.value.trim();
-
-    if (!address) {
-        showError("Please enter an Ethereum address.");
-        return;
+        renderFindingList(els.defiList, defiArray, "info",
+            "No interactions with known DeFi protocols detected in the analyzed transactions.");
     }
 
-    if (!/^0x[0-9a-fA-F]{40}$/.test(address)) {
-        showError("Invalid Ethereum address format. Must be 0x followed by 40 hex characters.");
-        return;
-    }
-
-    // UI: show loading state
-    setLoading(true);
-    hideError();
-    document.getElementById("resultsSection").style.display = "none";
-
-    try {
-        const resp = await fetch("/api/scan", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ address }),
-        });
-
-        if (!resp.ok) {
-            const err = await resp.json();
-            throw new Error(err.detail || "Scan failed");
+    function renderFindingList(container, findings, defaultSeverity, emptyMsg) {
+        container.innerHTML = "";
+        if (!findings.length) {
+            const p = document.createElement("p");
+            p.className = "finding-empty";
+            p.textContent = emptyMsg;
+            container.appendChild(p);
+            return;
         }
-
-        const results = await resp.json();
-        currentResults = results;
-        renderResults(results);
-    } catch (e) {
-        showError(`Scan failed: ${e.message}`);
-    } finally {
-        setLoading(false);
-    }
-}
-
-// ---- Rendering ----
-function renderResults(data) {
-    const section = document.getElementById("resultsSection");
-    section.style.display = "block";
-
-    // Scroll to results
-    setTimeout(() => {
-        section.scrollIntoView({ behavior: "smooth", block: "start" });
-    }, 100);
-
-    renderRiskScore(data.risk_score);
-    renderDataSource(data.data_source);
-    renderStatistics(data.statistics);
-    renderFindings(data.sanctions_findings, data.pattern_findings, data.defi_interactions);
-    renderRegulations(data.regulations_applicable);
-    renderNarrative(data.narrative);
-
-    // Analyzed timestamp
-    const analyzed = new Date(data.analyzed_at);
-    document.getElementById("analyzedAt").textContent =
-        `Analyzed: ${analyzed.toLocaleString()}`;
-}
-
-function renderRiskScore(risk) {
-    const scoreNum = document.getElementById("riskScoreNumber");
-    const scoreLabel = document.getElementById("riskScoreLabel");
-    const meterFill = document.getElementById("riskMeterFill");
-    const recommendation = document.getElementById("riskRecommendation");
-
-    // Animate score number
-    animateNumber(scoreNum, 0, risk.score, 800);
-
-    scoreNum.style.color = risk.color;
-    scoreLabel.textContent = risk.level;
-    scoreLabel.style.color = risk.color;
-
-    meterFill.style.width = `${risk.score}%`;
-    meterFill.style.background = risk.color;
-
-    recommendation.textContent = risk.recommendation;
-}
-
-function renderDataSource(source) {
-    // Remove existing data source banner if any
-    const existing = document.getElementById("dataSourceBanner");
-    if (existing) existing.remove();
-
-    if (source === "demo") {
-        const banner = document.createElement("div");
-        banner.id = "dataSourceBanner";
-        banner.style.cssText =
-            "background:rgba(59,130,246,0.08);border:1px solid rgba(59,130,246,0.2);" +
-            "border-radius:8px;padding:12px 16px;margin-bottom:16px;font-size:0.82rem;" +
-            "color:#94a3b8;display:flex;align-items:center;gap:8px;";
-        banner.innerHTML =
-            '<strong style="color:#3b82f6;">DEMO MODE</strong> ' +
-            "Using pre-loaded sample data. Add an Etherscan API key (.env) for live blockchain data. " +
-            "Balance is fetched live via public RPC.";
-        const results = document.getElementById("resultsSection");
-        results.insertBefore(banner, results.firstChild);
-    }
-}
-
-function animateNumber(element, from, to, duration) {
-    const start = performance.now();
-    const update = (now) => {
-        const elapsed = now - start;
-        const progress = Math.min(elapsed / duration, 1);
-        const eased = 1 - Math.pow(1 - progress, 3); // easeOutCubic
-        const current = Math.round(from + (to - from) * eased);
-        element.textContent = current;
-        if (progress < 1) requestAnimationFrame(update);
-    };
-    requestAnimationFrame(update);
-}
-
-function renderStatistics(stats) {
-    const grid = document.getElementById("statsGrid");
-    grid.innerHTML = "";
-
-    const items = [
-        {
-            label: "ETH Balance",
-            value: `${stats.eth_balance.toFixed(4)}`,
-            sub: "ETH",
-        },
-        {
-            label: "Transactions",
-            value: stats.total_transactions.toLocaleString(),
-            sub: `${stats.total_token_transfers} token transfers`,
-        },
-        {
-            label: "Counterparties",
-            value: stats.unique_counterparties.toLocaleString(),
-            sub: "unique addresses",
-        },
-        {
-            label: "Address Age",
-            value: stats.address_age_days !== null ? stats.address_age_days.toLocaleString() : "N/A",
-            sub: "days",
-        },
-        {
-            label: "ETH Sent",
-            value: formatNumber(stats.total_eth_sent),
-            sub: "ETH total outflow",
-        },
-        {
-            label: "ETH Received",
-            value: formatNumber(stats.total_eth_received),
-            sub: "ETH total inflow",
-        },
-        {
-            label: "Gas Spent",
-            value: stats.total_gas_spent_eth.toFixed(4),
-            sub: "ETH in gas fees",
-        },
-        {
-            label: "Top Token",
-            value: stats.top_tokens.length > 0 ? stats.top_tokens[0].symbol : "N/A",
-            sub:
-                stats.top_tokens.length > 0
-                    ? `${stats.top_tokens[0].transfer_count} transfers`
-                    : "no token activity",
-        },
-    ];
-
-    items.forEach((item) => {
-        const card = document.createElement("div");
-        card.className = "stat-card";
-        card.innerHTML = `
-            <div class="stat-label">${item.label}</div>
-            <div class="stat-value">${item.value}</div>
-            <div class="stat-sub">${item.sub}</div>
-        `;
-        grid.appendChild(card);
-    });
-}
-
-function renderFindings(sanctions, patterns, defi) {
-    // Sanctions
-    const sanctionsList = document.getElementById("sanctionsList");
-    sanctionsList.innerHTML = "";
-    if (sanctions.length === 0) {
-        sanctionsList.innerHTML = '<p class="finding-none">No sanctions exposure detected. Address is not on the OFAC SDN list and no counterparties match sanctioned entities.</p>';
-    } else {
-        sanctions.forEach((f) => {
-            sanctionsList.appendChild(createFindingItem(f));
-        });
-    }
-
-    // Patterns
-    const patternsList = document.getElementById("patternsList");
-    patternsList.innerHTML = "";
-    if (patterns.length === 0) {
-        patternsList.innerHTML = '<p class="finding-none">No suspicious transaction patterns detected in the analyzed dataset.</p>';
-    } else {
-        patterns.forEach((f) => {
-            patternsList.appendChild(createFindingItem(f));
-        });
-    }
-
-    // DeFi
-    const defiList = document.getElementById("defiList");
-    defiList.innerHTML = "";
-    const protocols = Object.entries(defi);
-    if (protocols.length === 0) {
-        defiList.innerHTML = '<p class="finding-none">No interactions with known DeFi protocols detected in the analyzed transactions.</p>';
-    } else {
-        protocols.forEach(([name, info]) => {
+        findings.forEach(function (f) {
+            const sev = (f.severity || defaultSeverity).toLowerCase();
             const item = document.createElement("div");
-            item.className = "finding-item";
-            item.innerHTML = `
-                <span class="finding-severity severity-low">DEFI</span>
-                <span class="finding-text"><strong>${name}</strong> -- ${info.count} interaction(s)</span>
-            `;
-            defiList.appendChild(item);
+            item.className = "finding-item severity-" + sev;
+            const titleText = f.title || prettifyType(f.type) || "Finding";
+            item.innerHTML =
+                `<span class="finding-severity severity-badge-${sev}">${escapeHtml(f.severity || defaultSeverity)}</span>` +
+                `<div class="finding-body">` +
+                    `<div class="finding-title">${escapeHtml(titleText)}</div>` +
+                    `<div class="finding-desc">${escapeHtml(f.description || "")}</div>` +
+                `</div>`;
+            container.appendChild(item);
         });
     }
-}
 
-function createFindingItem(finding) {
-    const item = document.createElement("div");
-    item.className = "finding-item";
-    const severityClass = `severity-${finding.severity.toLowerCase()}`;
-    item.innerHTML = `
-        <span class="finding-severity ${severityClass}">${finding.severity}</span>
-        <span class="finding-text">${finding.description}</span>
-    `;
-    return item;
-}
+    function prettifyType(type) {
+        if (!type) return "";
+        return type.replace(/_/g, " ").replace(/\b\w/g, function (c) { return c.toUpperCase(); });
+    }
 
-function renderRegulations(regs) {
-    const grid = document.getElementById("regulationsGrid");
-    grid.innerHTML = "";
+    function renderNarrative(markdown) {
+        els.narrativeContent.innerHTML = markdownToHtml(markdown);
+    }
 
-    regs.forEach((reg) => {
-        const card = document.createElement("div");
-        card.className = "regulation-card";
-        card.innerHTML = `
-            <div class="regulation-name">${reg.name}</div>
-            <div class="regulation-deadline">Deadline: ${reg.deadline}</div>
-            <div class="regulation-relevance">${reg.relevance}</div>
-        `;
-        grid.appendChild(card);
-    });
-}
+    // ---- Markdown (lightweight) ------------------------------------------
+    function markdownToHtml(md) {
+        if (!md) return "<p>No narrative generated.</p>";
 
-function renderNarrative(markdown) {
-    const container = document.getElementById("narrativeContent");
-    container.innerHTML = markdownToHtml(markdown);
-}
+        let html = md
+            .replace(/&/g, "&amp;")
+            .replace(/</g, "&lt;")
+            .replace(/>/g, "&gt;")
+            .replace(/^### (.+)$/gm, "<h3>$1</h3>")
+            .replace(/^## (.+)$/gm, "<h2>$1</h2>")
+            .replace(/^# (.+)$/gm, "<h2>$1</h2>")
+            .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
+            .replace(/\*(.+?)\*/g, "<em>$1</em>")
+            .replace(/`([^`]+)`/g, "<code>$1</code>")
+            .replace(/^---+$/gm, "<hr>")
+            .replace(/^- (.+)$/gm, "<li>$1</li>")
+            .replace(/^\d+\. (.+)$/gm, "<li>$1</li>")
+            .replace(/\n\n/g, "</p><p>")
+            .replace(/\n/g, "<br>");
 
-// ---- Simple Markdown to HTML ----
-function markdownToHtml(md) {
-    if (!md) return "<p>No narrative generated.</p>";
+        html = html.replace(/(<li>.*?<\/li>(?:<br>)?)+/g, function (match) {
+            const cleaned = match.replace(/<br>/g, "");
+            return "<ul>" + cleaned + "</ul>";
+        });
 
-    let html = md
-        // Escape HTML entities first
-        .replace(/&/g, "&amp;")
-        .replace(/</g, "&lt;")
-        .replace(/>/g, "&gt;")
-        // Headers
-        .replace(/^### (.+)$/gm, "<h3>$1</h3>")
-        .replace(/^## (.+)$/gm, "<h2>$1</h2>")
-        .replace(/^# (.+)$/gm, "<h2>$1</h2>")
-        // Bold and italic
-        .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
-        .replace(/\*(.+?)\*/g, "<em>$1</em>")
-        // Inline code
-        .replace(/`([^`]+)`/g, "<code>$1</code>")
-        // Horizontal rules
-        .replace(/^---+$/gm, "<hr>")
-        // Unordered lists
-        .replace(/^- (.+)$/gm, "<li>$1</li>")
-        // Ordered lists
-        .replace(/^\d+\. (.+)$/gm, "<li>$1</li>")
-        // Paragraphs
-        .replace(/\n\n/g, "</p><p>")
-        // Line breaks
-        .replace(/\n/g, "<br>");
+        // Markdown tables
+        html = html.replace(
+            /\|(.+)\|(?:<br>)\|[-| ]+\|(?:<br>)((?:\|.+\|(?:<br>)?)+)/g,
+            function (match, header, body) {
+                const headers = header.split("|").filter(Boolean)
+                    .map(function (h) { return "<th>" + h.trim() + "</th>"; }).join("");
+                const rows = body.split("<br>").filter(Boolean)
+                    .map(function (row) {
+                        const cells = row.split("|").filter(Boolean)
+                            .map(function (c) { return "<td>" + c.trim() + "</td>"; }).join("");
+                        return "<tr>" + cells + "</tr>";
+                    }).join("");
+                return "<table><thead><tr>" + headers + "</tr></thead><tbody>" + rows + "</tbody></table>";
+            }
+        );
 
-    // Wrap consecutive <li> in <ul>
-    html = html.replace(/(<li>.*?<\/li>(?:<br>)?)+/g, (match) => {
-        const cleaned = match.replace(/<br>/g, "");
-        return `<ul>${cleaned}</ul>`;
-    });
+        return "<p>" + html + "</p>";
+    }
 
-    // Handle tables
-    html = html.replace(
-        /\|(.+)\|(?:<br>)\|[-| ]+\|(?:<br>)((?:\|.+\|(?:<br>)?)+)/g,
-        (match, header, body) => {
-            const headers = header.split("|").filter(Boolean).map((h) => `<th>${h.trim()}</th>`).join("");
-            const rows = body
-                .split("<br>")
-                .filter(Boolean)
-                .map((row) => {
-                    const cells = row.split("|").filter(Boolean).map((c) => `<td>${c.trim()}</td>`).join("");
-                    return `<tr>${cells}</tr>`;
-                })
-                .join("");
-            return `<table><thead><tr>${headers}</tr></thead><tbody>${rows}</tbody></table>`;
+    // ---- Errors ----------------------------------------------------------
+    function showError(title, msg) {
+        els.errorTitle.textContent = title;
+        els.errorMessage.textContent = msg;
+        els.errorBanner.hidden = false;
+    }
+
+    function hideError() {
+        els.errorBanner.hidden = true;
+    }
+
+    // ---- Utilities -------------------------------------------------------
+    function clamp(n, min, max) { return Math.max(min, Math.min(max, n)); }
+
+    function formatInt(n) {
+        return (Number(n) || 0).toLocaleString();
+    }
+
+    function formatEth(n) {
+        const v = Number(n) || 0;
+        if (v >= 1_000_000) return (v / 1_000_000).toFixed(2) + "M ETH";
+        if (v >= 1_000) return (v / 1_000).toFixed(2) + "K ETH";
+        if (v >= 1) return v.toFixed(2) + " ETH";
+        return v.toFixed(4) + " ETH";
+    }
+
+    function truncateAddress(addr) {
+        if (!addr || addr.length < 12) return addr || "";
+        return addr.slice(0, 6) + "..." + addr.slice(-4);
+    }
+
+    function escapeHtml(s) {
+        if (s === null || s === undefined) return "";
+        return String(s)
+            .replace(/&/g, "&amp;")
+            .replace(/</g, "&lt;")
+            .replace(/>/g, "&gt;")
+            .replace(/"/g, "&quot;")
+            .replace(/'/g, "&#39;");
+    }
+
+    function animateNumber(element, from, to, duration) {
+        const start = performance.now();
+        function tick(now) {
+            const elapsed = now - start;
+            const progress = Math.min(elapsed / duration, 1);
+            const eased = 1 - Math.pow(1 - progress, 3);
+            const current = Math.round(from + (to - from) * eased);
+            element.textContent = current;
+            if (progress < 1) requestAnimationFrame(tick);
         }
-    );
+        requestAnimationFrame(tick);
+    }
 
-    return `<p>${html}</p>`;
-}
+    function copyText(text, button, defaultLabel) {
+        if (!navigator.clipboard) return;
+        navigator.clipboard.writeText(text).then(function () {
+            const original = defaultLabel || button.textContent;
+            button.textContent = "Copied";
+            setTimeout(function () { button.textContent = original; }, 1500);
+        }).catch(function () { /* ignore */ });
+    }
 
-// ---- Utilities ----
-function setLoading(loading) {
-    const btn = document.getElementById("scanButton");
-    const text = btn.querySelector(".button-text");
-    const spinner = btn.querySelector(".button-loading");
-
-    btn.disabled = loading;
-    text.style.display = loading ? "none" : "inline";
-    spinner.style.display = loading ? "inline" : "none";
-}
-
-function showError(msg) {
-    const banner = document.getElementById("errorBanner");
-    const message = document.getElementById("errorMessage");
-    message.textContent = msg;
-    banner.style.display = "block";
-}
-
-function hideError() {
-    document.getElementById("errorBanner").style.display = "none";
-}
-
-function formatNumber(num) {
-    if (num >= 1000000) return (num / 1000000).toFixed(2) + "M";
-    if (num >= 1000) return (num / 1000).toFixed(2) + "K";
-    return num.toFixed(4);
-}
-
-function copyNarrative() {
-    if (!currentResults || !currentResults.narrative) return;
-    navigator.clipboard.writeText(currentResults.narrative).then(() => {
-        const btn = document.querySelector(".copy-button");
-        btn.textContent = "Copied!";
-        setTimeout(() => {
-            btn.textContent = "Copy Report";
-        }, 2000);
-    });
-}
+})();

@@ -1,20 +1,54 @@
-"""Application configuration loaded from environment variables."""
+"""
+Application configuration loaded from environment variables.
+
+Data source notes
+-----------------
+The scanner reads live Ethereum mainnet data from one of two upstreams,
+depending on whether an Etherscan key is provided:
+
+  ETHERSCAN_API_KEY (optional)
+      When set, the scanner uses the Etherscan V2 unified API. This is
+      the preferred path because it has higher rate limits and includes
+      richer historical data. Get a free key at https://etherscan.io/myapikey
+
+  No key configured (default)
+      The scanner falls back to the free Blockscout public API at
+      https://eth.blockscout.com which returns data in the same schema
+      as Etherscan and requires no signup. Rate limits are lower so
+      heavy use should configure an Etherscan key.
+
+ETH balance lookups always go through a public JSON-RPC endpoint
+because both Etherscan and Blockscout occasionally lag behind chain
+state for balance queries.
+"""
 
 import os
+
 from dotenv import load_dotenv
 
 load_dotenv()
 
+# --- API keys (optional) -------------------------------------------------
 ETHERSCAN_API_KEY = os.getenv("ETHERSCAN_API_KEY", "")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+
+# --- Server config -------------------------------------------------------
 HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "8000"))
 
-# Etherscan V2 API (migrated May 2025)
+# --- Upstream endpoints --------------------------------------------------
+# Etherscan V2 (single endpoint, multi-chain via chainid param)
 ETHERSCAN_V2_BASE_URL = "https://api.etherscan.io/v2/api"
 
-# Known OFAC-sanctioned addresses (subset for demo purposes)
-# In production, this would be fetched from the OFAC SDN list API
+# Blockscout free Ethereum mainnet endpoint (no API key required)
+BLOCKSCOUT_BASE = "https://eth.blockscout.com/api"
+
+# Public JSON-RPC endpoint used for live balance lookups
+PUBLIC_RPC_URL = os.getenv("PUBLIC_RPC_URL", "https://ethereum-rpc.publicnode.com")
+
+
+# --- OFAC sanctioned addresses (subset for screening demo) ---------------
+# In production this would be hydrated from the official OFAC SDN feed.
 SANCTIONED_ADDRESSES = {
     "0x8589427373d6d84e98730d7795d8f6f8731fda16",  # Tornado Cash: Router
     "0xd90e2f925da726b50c4ed8d0fb90ad053324f31b",  # Tornado Cash: 100 ETH
@@ -28,7 +62,7 @@ SANCTIONED_ADDRESSES = {
     "0xb541fc07bc7619fd4062a54d96268525cbc6ffef",  # Tornado Cash: 1000 ETH
 }
 
-# Known DeFi protocol addresses for classification
+# --- Known DeFi protocol addresses for classification --------------------
 KNOWN_PROTOCOLS = {
     "0x7a250d5630b4cf539739df2c5dacb4c659f2488d": "Uniswap V2: Router",
     "0xe592427a0aece92de3edee1f18e0157c05861564": "Uniswap V3: Router",
@@ -44,14 +78,14 @@ KNOWN_PROTOCOLS = {
     "0x3fc91a3afd70395cd496c647d5a6cc9d4b2b7fad": "Uniswap: Universal Router",
 }
 
-# Risk weight configuration
+# --- Risk weight configuration -------------------------------------------
 RISK_WEIGHTS = {
-    "sanctioned_interaction": 100,  # Direct interaction with OFAC sanctioned address
-    "high_value_transfer": 15,      # Transfers over $100K equivalent
-    "mixer_interaction": 80,        # Known mixer/tumbler usage
-    "rapid_movement": 25,           # Funds moved quickly through address
-    "new_address": 10,              # Address less than 30 days old
-    "concentrated_counterparty": 20,# Most volume to/from single address
-    "bridge_usage": 5,              # Cross-chain bridge interaction (not inherently risky)
-    "known_protocol": -10,          # Interaction with verified DeFi protocols (risk reduction)
+    "sanctioned_interaction": 100,   # Direct interaction with OFAC sanctioned address
+    "high_value_transfer": 15,       # Transfers over a high notional threshold
+    "mixer_interaction": 80,         # Known mixer/tumbler usage
+    "rapid_movement": 25,            # Funds moved quickly through address
+    "new_address": 10,               # Address less than 30 days old
+    "concentrated_counterparty": 20, # Most volume to/from a single address
+    "bridge_usage": 5,               # Cross-chain bridge interaction
+    "known_protocol": -10,           # Verified DeFi protocol use (risk reducer)
 }

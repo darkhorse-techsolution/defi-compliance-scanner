@@ -14,23 +14,25 @@ Risk factors assessed:
 - DeFi protocol interaction classification
 """
 
-import pandas as pd
-from datetime import datetime, timezone, timedelta
-from collections import Counter
+from datetime import datetime, timezone
 
-from app.config import SANCTIONED_ADDRESSES, KNOWN_PROTOCOLS, RISK_WEIGHTS
+import pandas as pd
+
+from app.config import KNOWN_PROTOCOLS, RISK_WEIGHTS, SANCTIONED_ADDRESSES
 
 
 def screen_sanctions(wallet_data: dict) -> list[dict]:
     """
-    Screen all counterparties against OFAC sanctions list.
-    This is the #1 compliance requirement for any crypto firm.
+    Screen all counterparties against the OFAC sanctions list. This is the
+    single most important compliance check for any crypto firm. The function
+    is defensive about real-world data: missing fields, NaT timestamps and
+    empty frames are all handled.
     """
     findings = []
-    address = wallet_data["address"]
+    address = wallet_data.get("address", "")
 
     # Check if the address itself is sanctioned
-    if address.lower() in SANCTIONED_ADDRESSES:
+    if address and address.lower() in SANCTIONED_ADDRESSES:
         findings.append({
             "type": "sanctioned_address",
             "severity": "CRITICAL",
@@ -38,42 +40,53 @@ def screen_sanctions(wallet_data: dict) -> list[dict]:
             "risk_score": 100,
         })
 
-    # Screen transaction counterparties
-    tx_df = wallet_data["transactions"]
-    if not tx_df.empty:
+    def _format_when(value) -> str:
+        if value is None or pd.isna(value):
+            return "unknown date"
+        try:
+            return value.strftime("%Y-%m-%d")
+        except AttributeError:
+            return "unknown date"
+
+    # Screen native ETH transaction counterparties
+    tx_df = wallet_data.get("transactions")
+    if isinstance(tx_df, pd.DataFrame) and not tx_df.empty:
         for _, row in tx_df.iterrows():
-            counterparty = row.get("counterparty", "")
-            if counterparty and counterparty.lower() in SANCTIONED_ADDRESSES:
+            counterparty = str(row.get("counterparty", "") or "").lower()
+            if counterparty and counterparty in SANCTIONED_ADDRESSES:
+                value_eth = row.get("value_eth", 0) or 0
                 findings.append({
                     "type": "sanctioned_interaction",
                     "severity": "CRITICAL",
                     "description": (
-                        f"{'Sent to' if row['direction'] == 'outgoing' else 'Received from'} "
+                        f"{'Sent to' if row.get('direction') == 'outgoing' else 'Received from'} "
                         f"OFAC-sanctioned address {counterparty[:10]}... "
-                        f"({row['value_eth']:.4f} ETH on {row['datetime'].strftime('%Y-%m-%d')})"
+                        f"({float(value_eth):.4f} ETH on {_format_when(row.get('datetime'))})"
                     ),
                     "risk_score": RISK_WEIGHTS["sanctioned_interaction"],
                     "tx_hash": row.get("hash", ""),
-                    "timestamp": row["datetime"].isoformat() if pd.notna(row["datetime"]) else None,
+                    "timestamp": row["datetime"].isoformat()
+                        if pd.notna(row.get("datetime")) else None,
                 })
 
     # Screen token transfer counterparties
-    token_df = wallet_data["token_transfers"]
-    if not token_df.empty:
+    token_df = wallet_data.get("token_transfers")
+    if isinstance(token_df, pd.DataFrame) and not token_df.empty:
         for _, row in token_df.iterrows():
-            counterparty = row.get("counterparty", "")
-            if counterparty and counterparty.lower() in SANCTIONED_ADDRESSES:
+            counterparty = str(row.get("counterparty", "") or "").lower()
+            if counterparty and counterparty in SANCTIONED_ADDRESSES:
                 findings.append({
                     "type": "sanctioned_interaction",
                     "severity": "CRITICAL",
                     "description": (
-                        f"Token transfer {'to' if row['direction'] == 'outgoing' else 'from'} "
+                        f"Token transfer {'to' if row.get('direction') == 'outgoing' else 'from'} "
                         f"OFAC-sanctioned address: {row.get('tokenSymbol', 'Unknown')} "
-                        f"on {row['datetime'].strftime('%Y-%m-%d')}"
+                        f"on {_format_when(row.get('datetime'))}"
                     ),
                     "risk_score": RISK_WEIGHTS["sanctioned_interaction"],
                     "tx_hash": row.get("hash", ""),
-                    "timestamp": row["datetime"].isoformat() if pd.notna(row["datetime"]) else None,
+                    "timestamp": row["datetime"].isoformat()
+                        if pd.notna(row.get("datetime")) else None,
                 })
 
     return findings
@@ -81,13 +94,13 @@ def screen_sanctions(wallet_data: dict) -> list[dict]:
 
 def analyze_transaction_patterns(wallet_data: dict) -> list[dict]:
     """
-    Analyze transaction patterns for suspicious behavior.
-    This is where data engineering meets compliance analytics.
+    Analyze transaction patterns for suspicious behavior. This is where
+    data engineering meets compliance analytics.
     """
     findings = []
-    tx_df = wallet_data["transactions"]
+    tx_df = wallet_data.get("transactions")
 
-    if tx_df.empty:
+    if not isinstance(tx_df, pd.DataFrame) or tx_df.empty:
         return findings
 
     # 1. High-value transfer detection (> 10 ETH as proxy for ~$25K+)
@@ -181,15 +194,16 @@ def analyze_transaction_patterns(wallet_data: dict) -> list[dict]:
 
 def classify_defi_interactions(wallet_data: dict) -> dict:
     """
-    Classify which DeFi protocols the address interacts with.
-    This provides context for compliance officers about the address's activity.
+    Classify which DeFi protocols the address interacts with. Useful
+    context for compliance officers - it shows that activity is anchored
+    in known, legitimate venues rather than obscure smart contracts.
     """
-    tx_df = wallet_data["transactions"]
-    token_df = wallet_data["token_transfers"]
+    tx_df = wallet_data.get("transactions")
+    token_df = wallet_data.get("token_transfers")
     protocols_seen = {}
 
-    for df in [tx_df, token_df]:
-        if df.empty:
+    for df in (tx_df, token_df):
+        if not isinstance(df, pd.DataFrame) or df.empty:
             continue
         for _, row in df.iterrows():
             counterparty = row.get("counterparty", "").lower()
@@ -284,34 +298,50 @@ def compute_risk_score(sanctions_findings: list, pattern_findings: list, defi_in
 
 
 def generate_statistics(wallet_data: dict) -> dict:
-    """Generate summary statistics for the wallet."""
-    tx_df = wallet_data["transactions"]
-    token_df = wallet_data["token_transfers"]
+    """Generate summary statistics for the wallet, plus a daily activity series."""
+    tx_df = wallet_data.get("transactions")
+    token_df = wallet_data.get("token_transfers")
+    balance = wallet_data.get("balance") or {}
 
     stats = {
-        "eth_balance": wallet_data["balance"]["balance_eth"],
-        "total_transactions": wallet_data["transaction_count"],
-        "total_token_transfers": wallet_data["token_transfer_count"],
-        "address_age_days": wallet_data["address_age_days"],
+        "eth_balance": float(balance.get("balance_eth", 0) or 0),
+        "total_transactions": int(wallet_data.get("transaction_count", 0) or 0),
+        "total_token_transfers": int(wallet_data.get("token_transfer_count", 0) or 0),
+        "address_age_days": wallet_data.get("address_age_days"),
         "unique_counterparties": 0,
-        "total_eth_sent": 0,
-        "total_eth_received": 0,
-        "total_gas_spent_eth": 0,
+        "total_eth_sent": 0.0,
+        "total_eth_received": 0.0,
+        "total_gas_spent_eth": 0.0,
         "top_tokens": [],
         "activity_period": {"first": None, "last": None},
+        "timeline": [],
     }
 
-    if not tx_df.empty:
-        stats["unique_counterparties"] = tx_df["counterparty"].nunique()
+    if isinstance(tx_df, pd.DataFrame) and not tx_df.empty:
+        stats["unique_counterparties"] = int(tx_df["counterparty"].nunique())
         outgoing = tx_df[tx_df["direction"] == "outgoing"]
         incoming = tx_df[tx_df["direction"] == "incoming"]
-        stats["total_eth_sent"] = round(outgoing["value_eth"].sum(), 4)
-        stats["total_eth_received"] = round(incoming["value_eth"].sum(), 4)
-        stats["total_gas_spent_eth"] = round(tx_df["gas_cost_eth"].sum(), 6)
+        stats["total_eth_sent"] = round(float(outgoing["value_eth"].sum()), 4)
+        stats["total_eth_received"] = round(float(incoming["value_eth"].sum()), 4)
+        stats["total_gas_spent_eth"] = round(float(tx_df["gas_cost_eth"].sum()), 6)
         stats["activity_period"]["first"] = tx_df["datetime"].min().isoformat()
         stats["activity_period"]["last"] = tx_df["datetime"].max().isoformat()
 
-    if not token_df.empty:
+        # Daily transaction count timeline (used by the frontend chart)
+        daily = (
+            tx_df.assign(day=tx_df["datetime"].dt.strftime("%Y-%m-%d"))
+            .groupby("day")
+            .size()
+            .reset_index(name="count")
+            .sort_values("day")
+            .tail(60)
+        )
+        stats["timeline"] = [
+            {"date": row["day"], "count": int(row["count"])}
+            for _, row in daily.iterrows()
+        ]
+
+    if isinstance(token_df, pd.DataFrame) and not token_df.empty:
         token_summary = (
             token_df.groupby("tokenSymbol")["token_amount"]
             .agg(["sum", "count"])
@@ -319,7 +349,11 @@ def generate_statistics(wallet_data: dict) -> dict:
             .head(5)
         )
         stats["top_tokens"] = [
-            {"symbol": sym, "transfer_count": int(row["count"]), "total_volume": round(row["sum"], 2)}
+            {
+                "symbol": sym,
+                "transfer_count": int(row["count"]),
+                "total_volume": round(float(row["sum"]), 2),
+            }
             for sym, row in token_summary.iterrows()
         ]
 
@@ -328,31 +362,35 @@ def generate_statistics(wallet_data: dict) -> dict:
 
 def run_risk_analysis(wallet_data: dict) -> dict:
     """
-    Main risk analysis pipeline. Orchestrates all analysis layers
-    and produces a complete compliance risk report.
+    Main risk analysis pipeline. Orchestrates all analysis layers and
+    produces a complete compliance risk report. The function never raises
+    on bad data - if everything is empty, the report just shows zero
+    findings and a LOW score, with the upstream errors surfaced in the
+    "fetch_errors" field for the frontend to display.
     """
-    # Layer 1: Sanctions screening
     sanctions_findings = screen_sanctions(wallet_data)
-
-    # Layer 2: Pattern analysis
     pattern_findings = analyze_transaction_patterns(wallet_data)
-
-    # Layer 3: DeFi classification
     defi_interactions = classify_defi_interactions(wallet_data)
-
-    # Layer 4: Risk scoring
     risk_score = compute_risk_score(sanctions_findings, pattern_findings, defi_interactions)
-
-    # Statistics
     statistics = generate_statistics(wallet_data)
 
+    # If no data came back at all and no findings, mark the report as
+    # informational so the frontend can show an empty-state message.
+    has_any_data = (
+        statistics["total_transactions"] > 0
+        or statistics["total_token_transfers"] > 0
+        or statistics["eth_balance"] > 0
+    )
+
     return {
-        "address": wallet_data["address"],
+        "address": wallet_data.get("address", ""),
         "risk_score": risk_score,
         "sanctions_findings": sanctions_findings,
         "pattern_findings": pattern_findings,
         "defi_interactions": defi_interactions,
         "statistics": statistics,
+        "has_data": has_any_data,
+        "fetch_errors": wallet_data.get("errors", []),
         "analyzed_at": datetime.now(timezone.utc).isoformat(),
         "regulations_applicable": [
             {
