@@ -11,7 +11,9 @@ A prototype demonstrating the intersection of:
 Built by Marc Watters / ComplianceNode.
 """
 
+import logging
 import re
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
@@ -19,18 +21,34 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from app.ai_narrative import generate_ai_narrative
-from app.blockchain import active_data_source, get_wallet_data
-from app.config import ANTHROPIC_API_KEY, ETHERSCAN_API_KEY
+from app.ai_narrative import generate_ai_narrative, has_anthropic_key
+from app.blockchain import DEPTH_PRESETS, active_data_source, get_wallet_data
+from app.config import ETHERSCAN_API_KEY
 from app.risk_engine import run_risk_analysis
+from app.sanctions import get_sanctioned_addresses, sanctions_status
+
+logger = logging.getLogger(__name__)
 
 # --- App setup -----------------------------------------------------------
 BASE_DIR = Path(__file__).resolve().parent.parent
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Warm the sanctions cache on boot so the first scan is instant."""
+    try:
+        addrs = await get_sanctioned_addresses()
+        logger.info("sanctions list warmed: %d addresses", len(addrs))
+    except Exception as exc:  # noqa: BLE001 - never block startup
+        logger.warning("sanctions warmup failed: %s", exc)
+    yield
+
+
 app = FastAPI(
     title="DeFi Compliance Risk Scanner",
     description="On-chain compliance intelligence powered by data engineering, blockchain analytics, and AI",
-    version="0.2.0",
+    version="0.3.0",
+    lifespan=lifespan,
 )
 
 app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
@@ -42,6 +60,28 @@ ETH_ADDRESS_REGEX = re.compile(r"^0x[0-9a-fA-F]{40}$")
 
 def _has_etherscan_key() -> bool:
     return bool(ETHERSCAN_API_KEY) and ETHERSCAN_API_KEY != "your_etherscan_api_key_here"
+
+
+def _resolve_depth(value) -> tuple[str, int]:
+    """
+    Turn an incoming ``depth`` value into a ``(label, max_results)`` pair.
+
+    Accepts either a preset label (``quick`` / ``standard`` / ``deep``)
+    or a raw integer. Unknown strings fall back to ``standard``. Raw
+    integers are clamped to the 10k upstream ceiling.
+    """
+    if value is None or value == "":
+        return "standard", DEPTH_PRESETS["standard"]
+    if isinstance(value, str):
+        label = value.strip().lower()
+        if label in DEPTH_PRESETS:
+            return label, DEPTH_PRESETS[label]
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return "standard", DEPTH_PRESETS["standard"]
+    n = max(50, min(n, 10000))
+    return "custom", n
 
 
 # --- Routes --------------------------------------------------------------
@@ -56,17 +96,22 @@ async def home(request: Request):
 async def health():
     """
     Health check endpoint. Returns the upstream the scanner is configured
-    to use plus whether optional API keys (Etherscan, Anthropic) are set.
-    Useful for prospects who want to verify the deployment is hitting
-    real chain data.
+    to use, whether optional API keys are set, and the current state of
+    the sanctions cache. Useful for prospects verifying the deployment
+    is hitting real data.
     """
+    status = sanctions_status()
     return {
         "status": "ok",
         "service": "defi-compliance-scanner",
         "version": app.version,
         "data_source": active_data_source(),
         "etherscan_api_key": "configured" if _has_etherscan_key() else "not_configured",
-        "anthropic_api_key": "configured" if ANTHROPIC_API_KEY else "not_configured",
+        "anthropic_api_key": "configured" if has_anthropic_key() else "not_configured",
+        "sanctions_list_size": status["size"],
+        "sanctions_source": status["source"],
+        "sanctions_updated_at": status["updated_at"],
+        "depth_presets": DEPTH_PRESETS,
     }
 
 
@@ -76,10 +121,17 @@ async def scan_address(request: Request):
     Main scan endpoint. Takes an Ethereum address, runs the full
     compliance analysis pipeline, and returns the result.
 
+    Request body:
+        {
+            "address": "0x...",
+            "depth": "quick" | "standard" | "deep"  (optional, default "standard")
+        }
+
     Pipeline:
-      1. Fetch on-chain data (data engineering layer)
-      2. Run risk analysis (blockchain analytics layer)
-      3. Generate compliance narrative (AI layer)
+      1. Warm the OFAC sanctions cache (no-op on warm boots)
+      2. Fetch on-chain data (data engineering layer)
+      3. Run risk analysis (blockchain analytics layer)
+      4. Generate compliance narrative (AI layer)
     """
     try:
         body = await request.json()
@@ -93,11 +145,22 @@ async def scan_address(request: Request):
             detail="Invalid Ethereum address. Must be 0x followed by 40 hexadecimal characters.",
         )
 
+    depth_label, max_results = _resolve_depth(body.get("depth"))
+
     try:
-        wallet_data = await get_wallet_data(address)
+        # Make sure the risk engine sees a fresh sanctions list even on
+        # cold boots where the lifespan warmup may still be in flight.
+        await get_sanctioned_addresses()
+
+        wallet_data = await get_wallet_data(address, max_results=max_results)
         analysis = run_risk_analysis(wallet_data)
-        analysis["narrative"] = await generate_ai_narrative(analysis)
+        narrative, narrative_source = await generate_ai_narrative(analysis)
+        analysis["narrative"] = narrative
+        analysis["narrative_source"] = narrative_source
         analysis["data_source"] = wallet_data.get("data_source", "unknown")
+        analysis["data_completeness"] = wallet_data.get("data_completeness")
+        analysis["depth"] = depth_label
+        analysis["max_results"] = max_results
         return JSONResponse(content=analysis)
     except HTTPException:
         raise

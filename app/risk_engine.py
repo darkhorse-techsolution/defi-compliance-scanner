@@ -18,7 +18,8 @@ from datetime import datetime, timezone
 
 import pandas as pd
 
-from app.config import KNOWN_PROTOCOLS, RISK_WEIGHTS, SANCTIONED_ADDRESSES
+from app.config import KNOWN_PROTOCOLS, RISK_WEIGHTS
+from app.sanctions import get_cached_sanctions_sync
 
 
 def screen_sanctions(wallet_data: dict) -> list[dict]:
@@ -27,12 +28,18 @@ def screen_sanctions(wallet_data: dict) -> list[dict]:
     single most important compliance check for any crypto firm. The function
     is defensive about real-world data: missing fields, NaT timestamps and
     empty frames are all handled.
+
+    The sanctions set is read from the live cache maintained by
+    ``app.sanctions``. Main.py warms that cache on startup and at the
+    top of every /api/scan call so by the time we get here the lookup
+    is a plain in-memory set check.
     """
     findings = []
     address = wallet_data.get("address", "")
+    sanctioned = get_cached_sanctions_sync()
 
     # Check if the address itself is sanctioned
-    if address and address.lower() in SANCTIONED_ADDRESSES:
+    if address and address.lower() in sanctioned:
         findings.append({
             "type": "sanctioned_address",
             "severity": "CRITICAL",
@@ -53,7 +60,7 @@ def screen_sanctions(wallet_data: dict) -> list[dict]:
     if isinstance(tx_df, pd.DataFrame) and not tx_df.empty:
         for _, row in tx_df.iterrows():
             counterparty = str(row.get("counterparty", "") or "").lower()
-            if counterparty and counterparty in SANCTIONED_ADDRESSES:
+            if counterparty and counterparty in sanctioned:
                 value_eth = row.get("value_eth", 0) or 0
                 findings.append({
                     "type": "sanctioned_interaction",
@@ -74,7 +81,7 @@ def screen_sanctions(wallet_data: dict) -> list[dict]:
     if isinstance(token_df, pd.DataFrame) and not token_df.empty:
         for _, row in token_df.iterrows():
             counterparty = str(row.get("counterparty", "") or "").lower()
-            if counterparty and counterparty in SANCTIONED_ADDRESSES:
+            if counterparty and counterparty in sanctioned:
                 findings.append({
                     "type": "sanctioned_interaction",
                     "severity": "CRITICAL",

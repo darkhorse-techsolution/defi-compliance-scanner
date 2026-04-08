@@ -21,6 +21,7 @@
         loadTheme();
         bindEvents();
         loadExampleAddresses();
+        loadHealthStatus();
     });
 
     function cacheEls() {
@@ -36,7 +37,8 @@
             "statVolume", "statAge", "statAgeSub", "statCounterparties",
             "activityChart", "chartEmpty", "regList",
             "findingsSub", "sanctionsList", "patternsList", "defiList",
-            "narrativeContent", "copyNarrativeBtn",
+            "narrativeContent", "copyNarrativeBtn", "narrativeSourceBadge",
+            "footerPowered",
             "themeToggle", "themeToggleIcon",
         ];
         ids.forEach((id) => { els[id] = $(id); });
@@ -123,6 +125,38 @@
         return "pill-low";
     }
 
+    // ---- Health / footer "powered by" ------------------------------------
+    async function loadHealthStatus() {
+        try {
+            const resp = await fetch("/api/health");
+            if (!resp.ok) return;
+            const data = await resp.json();
+            if (!els.footerPowered) return;
+
+            const sanctionsSize = Number(data.sanctions_list_size || 0);
+            const source = data.data_source === "etherscan_v2"
+                ? "Etherscan V2"
+                : "Blockscout (free tier)";
+            const parts = [];
+            parts.push("On-chain data via " + source);
+            if (sanctionsSize > 0) {
+                parts.push(sanctionsSize.toLocaleString() +
+                    " addresses in the OFAC sanctions cache");
+            }
+            if (data.anthropic_api_key === "configured") {
+                parts.push("Claude API enabled");
+            }
+            els.footerPowered.textContent = "Powered by: " + parts.join(" | ");
+        } catch (e) {
+            // non-fatal - just leave the default footer copy in place
+        }
+    }
+
+    function selectedDepth() {
+        const checked = document.querySelector('input[name="depth"]:checked');
+        return checked ? checked.value : "standard";
+    }
+
     // ---- Scan ------------------------------------------------------------
     async function scanAddress() {
         const address = (els.addressInput.value || "").trim();
@@ -147,7 +181,7 @@
             const resp = await fetch("/api/scan", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ address: address }),
+                body: JSON.stringify({ address: address, depth: selectedDepth() }),
             });
 
             if (!resp.ok) {
@@ -188,7 +222,7 @@
             data.pattern_findings || [],
             data.defi_interactions || {}
         );
-        renderNarrative(data.narrative);
+        renderNarrative(data.narrative, data.narrative_source);
 
         // Empty-state hint when no upstream data was returned
         if (data.has_data === false) {
@@ -257,13 +291,14 @@
     }
 
     function renderStats(stats, fullData) {
-        const truncated = fullData && fullData.data_truncated;
-        const pageLimit = (fullData && fullData.page_limit) || 200;
+        const completeness = (fullData && fullData.data_completeness) || "full";
+        const maxResults = (fullData && fullData.max_results) || 1000;
+        const isSample = completeness !== "full";
 
         els.statTransactions.textContent = formatInt(stats.total_transactions);
         els.statTransactionsSub.textContent =
             (stats.total_token_transfers || 0).toLocaleString() + " token transfers" +
-            (truncated ? " (sample)" : "");
+            (isSample ? " (" + completeness + ")" : "");
 
         const totalVolume = (stats.total_eth_sent || 0) + (stats.total_eth_received || 0);
         els.statVolume.textContent = formatEth(totalVolume);
@@ -283,19 +318,32 @@
 
         els.statCounterparties.textContent = formatInt(stats.unique_counterparties);
 
-        // Show a data-completeness disclaimer when results were capped
+        // Show a data-completeness disclaimer when we know the sample is
+        // not exhaustive. The message changes depending on whether we hit
+        // the quick-scan cap or the 10k upstream ceiling.
         let disclaimer = document.getElementById("dataSampleDisclaimer");
-        if (truncated) {
+        if (isSample) {
             if (!disclaimer) {
                 disclaimer = document.createElement("div");
                 disclaimer.id = "dataSampleDisclaimer";
                 disclaimer.className = "data-disclaimer";
                 els.resultsSection.insertBefore(disclaimer, els.resultsSection.firstChild);
             }
-            disclaimer.innerHTML =
-                "<strong>Note:</strong> Analysis based on the most recent " + pageLimit +
-                " transactions. This is a sample for a fast scan and may miss older activity. " +
-                "Address age is computed from a separate earliest-transaction lookup when available.";
+            if (completeness === "sample") {
+                disclaimer.innerHTML =
+                    "<strong>Quick scan:</strong> Analysis based on the most recent " +
+                    maxResults.toLocaleString() +
+                    " transactions. Pick <em>Standard</em> or <em>Deep</em> above for a " +
+                    "fuller view - address age is still computed from a separate " +
+                    "earliest-transaction lookup when possible.";
+            } else {
+                disclaimer.innerHTML =
+                    "<strong>Partial history:</strong> This wallet has more than " +
+                    maxResults.toLocaleString() +
+                    " transactions. The analysis covers the most recent activity " +
+                    "using block-range pagination. Re-run in <em>Deep</em> mode for " +
+                    "up to 5,000 results.";
+            }
         } else if (disclaimer) {
             disclaimer.remove();
         }
@@ -445,8 +493,27 @@
         return type.replace(/_/g, " ").replace(/\b\w/g, function (c) { return c.toUpperCase(); });
     }
 
-    function renderNarrative(markdown) {
+    function renderNarrative(markdown, source) {
         els.narrativeContent.innerHTML = markdownToHtml(markdown);
+        if (els.narrativeSourceBadge) {
+            if (source === "claude") {
+                els.narrativeSourceBadge.hidden = false;
+                els.narrativeSourceBadge.className =
+                    "narrative-source-badge source-claude";
+                els.narrativeSourceBadge.textContent = "Claude-generated";
+                els.narrativeSourceBadge.title =
+                    "Narrative generated by the Claude API.";
+            } else if (source === "rule_based") {
+                els.narrativeSourceBadge.hidden = false;
+                els.narrativeSourceBadge.className =
+                    "narrative-source-badge source-rule";
+                els.narrativeSourceBadge.textContent = "Rule-based";
+                els.narrativeSourceBadge.title =
+                    "Rule-based template (set ANTHROPIC_API_KEY to enable Claude).";
+            } else {
+                els.narrativeSourceBadge.hidden = true;
+            }
+        }
     }
 
     // ---- Markdown (lightweight) ------------------------------------------

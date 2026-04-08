@@ -338,6 +338,78 @@ code {
     text-align: center;
 }
 
+/* ---- Depth selector ------------------------------------------------- */
+.depth-selector {
+    display: flex;
+    justify-content: center;
+    gap: 10px;
+    margin-top: 16px;
+    padding: 0;
+    border: 0;
+    flex-wrap: wrap;
+}
+
+.depth-selector-legend {
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--text-faint);
+    width: 100%;
+    text-align: center;
+    margin-bottom: 8px;
+    padding: 0;
+}
+
+.depth-option {
+    position: relative;
+    cursor: pointer;
+}
+
+.depth-option input[type="radio"] {
+    position: absolute;
+    opacity: 0;
+    pointer-events: none;
+}
+
+.depth-option-label {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 2px;
+    padding: 8px 18px;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: var(--surface);
+    transition: border-color 0.15s ease, background 0.15s ease, color 0.15s ease;
+    min-width: 92px;
+}
+
+.depth-option-title {
+    font-size: 0.82rem;
+    font-weight: 600;
+    color: var(--text);
+}
+
+.depth-option-meta {
+    font-size: 0.7rem;
+    color: var(--text-faint);
+    font-family: "JetBrains Mono", monospace;
+}
+
+.depth-option:hover .depth-option-label {
+    border-color: color-mix(in srgb, var(--primary) 45%, var(--border));
+}
+
+.depth-option input[type="radio"]:checked + .depth-option-label {
+    border-color: var(--primary);
+    background: color-mix(in srgb, var(--primary) 10%, var(--surface));
+}
+
+.depth-option input[type="radio"]:focus-visible + .depth-option-label {
+    outline: 2px solid color-mix(in srgb, var(--primary) 55%, transparent);
+    outline-offset: 2px;
+}
+
 /* ---- Example chips -------------------------------------------------- */
 .example-chips {
     display: flex;
@@ -956,6 +1028,37 @@ code {
     color: var(--primary);
 }
 
+.narrative-header-left {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-wrap: wrap;
+}
+
+.narrative-source-badge {
+    font-size: 0.7rem;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    padding: 4px 10px;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+    background: var(--surface-2);
+    color: var(--text-muted);
+}
+
+.narrative-source-badge.source-claude {
+    border-color: color-mix(in srgb, var(--primary) 55%, transparent);
+    background: color-mix(in srgb, var(--primary) 14%, transparent);
+    color: var(--primary);
+}
+
+.narrative-source-badge.source-rule {
+    border-color: var(--border);
+    background: var(--surface-2);
+    color: var(--text-muted);
+}
+
 /* ---- How it works --------------------------------------------------- */
 .how-section {
     padding: 60px 24px 80px;
@@ -1055,6 +1158,14 @@ code {
     font-size: 0.82rem;
     color: var(--text-faint);
     margin-top: 4px;
+}
+
+.footer-powered {
+    font-size: 0.74rem;
+    color: var(--text-faint);
+    margin-top: 6px;
+    font-family: "JetBrains Mono", monospace;
+    letter-spacing: 0.01em;
 }
 
 .footer-links {

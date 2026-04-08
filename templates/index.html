@@ -66,6 +66,32 @@
                                 <span class="scan-button-spinner" aria-hidden="true"></span>
                             </button>
                         </div>
+
+                        <fieldset class="depth-selector" aria-label="Scan depth">
+                            <legend class="depth-selector-legend">Scan depth</legend>
+                            <label class="depth-option">
+                                <input type="radio" name="depth" value="quick">
+                                <span class="depth-option-label">
+                                    <span class="depth-option-title">Quick</span>
+                                    <span class="depth-option-meta">200 txs</span>
+                                </span>
+                            </label>
+                            <label class="depth-option">
+                                <input type="radio" name="depth" value="standard" checked>
+                                <span class="depth-option-label">
+                                    <span class="depth-option-title">Standard</span>
+                                    <span class="depth-option-meta">1,000 txs</span>
+                                </span>
+                            </label>
+                            <label class="depth-option">
+                                <input type="radio" name="depth" value="deep">
+                                <span class="depth-option-label">
+                                    <span class="depth-option-title">Deep</span>
+                                    <span class="depth-option-meta">5,000 txs</span>
+                                </span>
+                            </label>
+                        </fieldset>
+
                         <p class="scan-hint" id="scanHint">
                             Tip: paste any 0x address. Below are well-known public wallets you can try.
                         </p>
@@ -205,7 +231,10 @@
             <!-- Compliance narrative -->
             <div class="result-card narrative-card">
                 <div class="card-header">
-                    <h3>AI-generated compliance report</h3>
+                    <div class="narrative-header-left">
+                        <h3>AI-generated compliance report</h3>
+                        <span class="narrative-source-badge" id="narrativeSourceBadge" hidden></span>
+                    </div>
                     <button class="ghost-button" id="copyNarrativeBtn" type="button">Copy report</button>
                 </div>
                 <div class="narrative-content" id="narrativeContent"></div>
@@ -259,6 +288,9 @@
                 <div class="footer-brand">
                     <strong>ComplianceNode Scanner</strong>
                     <p>On-chain compliance data infrastructure for crypto firms.</p>
+                    <p class="footer-powered" id="footerPowered">
+                        Powered by live Ethereum data and the OFAC SDN list.
+                    </p>
                 </div>
                 <div class="footer-links">
                     <a href="https://compliancenode-website.pages.dev" target="_blank" rel="noopener">Built by ComplianceNode</a>

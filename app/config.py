@@ -47,8 +47,14 @@ BLOCKSCOUT_BASE = "https://eth.blockscout.com/api"
 PUBLIC_RPC_URL = os.getenv("PUBLIC_RPC_URL", "https://ethereum-rpc.publicnode.com")
 
 
-# --- OFAC sanctioned addresses (subset for screening demo) ---------------
-# In production this would be hydrated from the official OFAC SDN feed.
+# --- OFAC sanctioned addresses -------------------------------------------
+#
+# This is a hardcoded last-resort fallback. The scanner loads the live
+# OFAC SDN list at startup via app.sanctions (GitHub mirror first, then
+# the Treasury XML feed, then the on-disk cache from previous fetches).
+# If every one of those upstream sources fails the risk engine falls
+# back to the set below so the scanner still catches the handful of
+# addresses that any real compliance team already has on a blocklist.
 SANCTIONED_ADDRESSES = {
     "0x8589427373d6d84e98730d7795d8f6f8731fda16",  # Tornado Cash: Router
     "0xd90e2f925da726b50c4ed8d0fb90ad053324f31b",  # Tornado Cash: 100 ETH

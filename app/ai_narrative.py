@@ -1,178 +1,254 @@
 """
 Layer 3: AI-Powered Compliance Narrative Generation
 
-This layer demonstrates the AI skill -- taking structured risk data
-and generating human-readable compliance reports that a compliance
-officer can use directly. Falls back to rule-based generation if
-no API key is configured.
+Takes the structured risk report produced by the analytics layer and
+turns it into a human-readable compliance memo. Two backends are
+supported:
 
-In production, this would use fine-tuned models trained on actual
-compliance report templates and regulatory language.
+- **Claude API** (preferred). Activated automatically when the
+  ``ANTHROPIC_API_KEY`` environment variable is set. We use the
+  Anthropic async SDK with a structured prompt that asks Claude to
+  return a short, factual, markdown-formatted compliance report.
+
+- **Rule-based template** (fallback). Used when no key is configured
+  or when the Claude call fails for any reason. Produces a report
+  with the same section layout so the frontend doesn't have to care
+  which backend answered.
+
+The ``narrative_source`` field on the returned analysis dict tells
+the frontend which backend was used so it can surface an honest
+"Claude-generated" vs "Rule-based" badge.
 """
 
+from __future__ import annotations
+
+import json
+import logging
 import os
 from datetime import datetime, timezone
 
 try:
-    import anthropic
+    from anthropic import AsyncAnthropic
     HAS_ANTHROPIC = True
 except ImportError:
+    AsyncAnthropic = None  # type: ignore[assignment]
     HAS_ANTHROPIC = False
 
-from app.config import ANTHROPIC_API_KEY
+
+logger = logging.getLogger(__name__)
 
 
-def _build_prompt(analysis: dict) -> str:
-    """Build the prompt for AI narrative generation."""
-    address = analysis["address"]
-    risk = analysis["risk_score"]
-    stats = analysis["statistics"]
-    sanctions = analysis["sanctions_findings"]
-    patterns = analysis["pattern_findings"]
-    defi = analysis["defi_interactions"]
-    regs = analysis["regulations_applicable"]
+# Claude model used for narrative generation. Haiku is fast and cheap
+# and the prompt is tiny, so latency is dominated by network RTT.
+CLAUDE_MODEL = "claude-haiku-4-5"
+CLAUDE_MAX_TOKENS = 1500
+CLAUDE_TIMEOUT = 30.0
 
-    sanctions_text = "None detected." if not sanctions else "\n".join(
-        f"  - [{f['severity']}] {f['description']}" for f in sanctions
+
+NarrativeResult = tuple[str, str]
+"""Return type for generators: (markdown_body, source_label)."""
+
+
+def has_anthropic_key() -> bool:
+    """Return True when a Claude-capable API key is configured."""
+    if not HAS_ANTHROPIC:
+        return False
+    return bool(os.getenv("ANTHROPIC_API_KEY"))
+
+
+# =====================================================================
+# Claude prompt construction
+# =====================================================================
+
+def _truncate_json(obj, limit: int = 2000) -> str:
+    """Dump a structure as JSON, clipping to ``limit`` characters."""
+    try:
+        text = json.dumps(obj, indent=2, default=str)
+    except (TypeError, ValueError):
+        return "[]"
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "\n... (truncated)"
+
+
+def _build_claude_prompt(analysis: dict) -> str:
+    """Build the structured prompt we send to Claude."""
+    stats = analysis.get("statistics", {}) or {}
+    risk = analysis.get("risk_score", {}) or {}
+    sanctions = analysis.get("sanctions_findings", []) or []
+    patterns = analysis.get("pattern_findings", []) or []
+    defi = analysis.get("defi_interactions", {}) or {}
+
+    return (
+        "You are a blockchain compliance analyst writing a professional risk "
+        "assessment report. Your audience is a compliance officer at a crypto "
+        "firm who needs to make a go / no-go decision on this wallet.\n"
+        "\n"
+        "Data to analyze:\n"
+        f"- Wallet address: {analysis.get('address', 'unknown')}\n"
+        f"- Risk score: {risk.get('score', 0)}/100 ({risk.get('level', 'UNKNOWN')})\n"
+        f"- Sanctions findings: {len(sanctions)}\n"
+        f"- Pattern findings: {len(patterns)}\n"
+        f"- Total transactions analyzed: {stats.get('total_transactions', 0)}\n"
+        f"- Address age (days): {stats.get('address_age_days', 'unknown')}\n"
+        f"- ETH balance: {stats.get('eth_balance', 0)}\n"
+        f"- Unique counterparties: {stats.get('unique_counterparties', 0)}\n"
+        f"- Total ETH sent: {stats.get('total_eth_sent', 0)}\n"
+        f"- Total ETH received: {stats.get('total_eth_received', 0)}\n"
+        f"- Known DeFi protocols touched: {', '.join(defi.keys()) or 'none'}\n"
+        "\n"
+        "Sanctions findings detail:\n"
+        f"{_truncate_json(sanctions)}\n"
+        "\n"
+        "Pattern findings detail:\n"
+        f"{_truncate_json(patterns)}\n"
+        "\n"
+        "Write the report in Markdown with exactly these sections:\n"
+        "1. Executive Summary (2-3 sentences on overall risk)\n"
+        "2. Key Findings (bullet list of the most important observations)\n"
+        "3. Regulatory Implications (which of MiCA, FATF Travel Rule, OFAC, "
+        "and BSA are triggered and why)\n"
+        "4. Recommended Actions (specific, ordered steps a compliance "
+        "officer should take)\n"
+        "\n"
+        "Rules:\n"
+        "- Be factual. Reference specific data points by number.\n"
+        "- Use professional compliance language (EDD, CDD, SAR, CASP, VASP).\n"
+        "- Do not use emojis.\n"
+        "- Do not invent findings that are not in the data.\n"
+        "- Maximum 600 words total."
     )
-    patterns_text = "No notable patterns." if not patterns else "\n".join(
-        f"  - [{f['severity']}] {f['description']}" for f in patterns
-    )
-    defi_text = "No known DeFi protocol interactions." if not defi else "\n".join(
-        f"  - {name}: {info['count']} interactions" for name, info in defi.items()
-    )
-    regs_text = "\n".join(
-        f"  - {r['name']} (deadline: {r['deadline']}): {r['relevance']}" for r in regs
-    )
-
-    return f"""You are a blockchain compliance analyst generating a risk assessment report.
-Write a professional compliance report for the following wallet analysis.
-The report should be suitable for a compliance officer reviewing this address
-as part of their KYC/AML obligations.
-
-WALLET ANALYSIS DATA:
-- Address: {address}
-- Risk Score: {risk['score']}/100 ({risk['level']})
-- ETH Balance: {stats['eth_balance']:.4f} ETH
-- Total Transactions: {stats['total_transactions']}
-- Token Transfers: {stats['total_token_transfers']}
-- Unique Counterparties: {stats['unique_counterparties']}
-- Address Age: {stats['address_age_days'] or 'Unknown'} days
-- Total ETH Sent: {stats['total_eth_sent']} ETH
-- Total ETH Received: {stats['total_eth_received']} ETH
-
-SANCTIONS SCREENING:
-{sanctions_text}
-
-PATTERN ANALYSIS:
-{patterns_text}
-
-DEFI PROTOCOL INTERACTIONS:
-{defi_text}
-
-APPLICABLE REGULATIONS:
-{regs_text}
-
-Write the report with these sections:
-1. EXECUTIVE SUMMARY (2-3 sentences)
-2. RISK ASSESSMENT (explain the score and what drives it)
-3. KEY FINDINGS (bullet points of notable items)
-4. REGULATORY IMPLICATIONS (which regulations apply and what action is needed)
-5. RECOMMENDED ACTIONS (specific next steps for the compliance team)
-
-Keep it professional, factual, and actionable. Do not speculate beyond what the data shows.
-Use compliance industry terminology where appropriate (EDD, SAR, CDD, etc.).
-Format with markdown headers and bullet points."""
 
 
-async def generate_ai_narrative(analysis: dict) -> str:
+# =====================================================================
+# Main entry point
+# =====================================================================
+
+async def generate_ai_narrative(analysis: dict) -> NarrativeResult:
     """
-    Generate a compliance narrative using Claude API.
-    Falls back to rule-based generation if API is unavailable.
+    Generate a compliance narrative for ``analysis``.
+
+    Returns a ``(markdown, source)`` tuple. ``source`` is one of
+    ``"claude"`` or ``"rule_based"`` so the caller can surface a
+    trustworthy "which backend wrote this?" badge in the UI.
     """
-    if HAS_ANTHROPIC and ANTHROPIC_API_KEY:
+    if has_anthropic_key() and AsyncAnthropic is not None:
         try:
-            client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-            prompt = _build_prompt(analysis)
+            return await _generate_claude_narrative(analysis)
+        except Exception as exc:  # noqa: BLE001 - fall back on any error
+            logger.error("Claude narrative generation failed: %s", exc)
 
-            message = client.messages.create(
-                model="claude-sonnet-4-20250514",
-                max_tokens=1500,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            return message.content[0].text
-        except Exception as e:
-            # Fall back to rule-based if API call fails
-            return _generate_rule_based_narrative(analysis)
-    else:
-        return _generate_rule_based_narrative(analysis)
+    return _generate_rule_based_narrative(analysis), "rule_based"
 
+
+async def _generate_claude_narrative(analysis: dict) -> NarrativeResult:
+    """Call Claude and format the response for the narrative card."""
+    api_key = os.getenv("ANTHROPIC_API_KEY") or ""
+    client = AsyncAnthropic(api_key=api_key, timeout=CLAUDE_TIMEOUT)
+    prompt = _build_claude_prompt(analysis)
+
+    message = await client.messages.create(
+        model=CLAUDE_MODEL,
+        max_tokens=CLAUDE_MAX_TOKENS,
+        messages=[{"role": "user", "content": prompt}],
+    )
+
+    # Extract the text blocks from the response. The SDK returns a
+    # list of content blocks; we concatenate the text ones and ignore
+    # anything else (tool use, etc.) for robustness.
+    chunks: list[str] = []
+    for block in message.content or []:
+        text = getattr(block, "text", None)
+        if text:
+            chunks.append(text)
+    body = "".join(chunks).strip() or _generate_rule_based_narrative(analysis)
+
+    header = (
+        "## AI-generated compliance assessment\n\n"
+        f"*Generated by Claude ({CLAUDE_MODEL}) on "
+        f"{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}*\n\n"
+    )
+    return header + body, "claude"
+
+
+# =====================================================================
+# Rule-based fallback
+# =====================================================================
 
 def _generate_rule_based_narrative(analysis: dict) -> str:
     """
     Rule-based compliance narrative generation.
-    Used when AI API is not available. Demonstrates that the
-    system works standalone without external AI dependencies.
+
+    Used when the Claude API is not available or the call fails. Keeps
+    the section layout identical to the Claude output so the frontend
+    can render either response with the same code path.
     """
-    address = analysis["address"]
-    risk = analysis["risk_score"]
-    stats = analysis["statistics"]
-    sanctions = analysis["sanctions_findings"]
-    patterns = analysis["pattern_findings"]
-    defi = analysis["defi_interactions"]
-    regs = analysis["regulations_applicable"]
+    address = analysis.get("address", "")
+    risk = analysis.get("risk_score", {}) or {}
+    stats = analysis.get("statistics", {}) or {}
+    sanctions = analysis.get("sanctions_findings", []) or []
+    patterns = analysis.get("pattern_findings", []) or []
+    defi = analysis.get("defi_interactions", {}) or {}
+    regs = analysis.get("regulations_applicable", []) or []
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
+    level = risk.get("level", "LOW")
+    score = risk.get("score", 0)
+
     # Executive summary based on risk level
-    if risk["level"] == "CRITICAL":
+    if level == "CRITICAL":
         exec_summary = (
-            f"This address presents **critical compliance risk** with a score of {risk['score']}/100. "
+            f"This address presents **critical compliance risk** with a score of {score}/100. "
             f"OFAC sanctions exposure has been detected. Immediate review and potential blocking is recommended "
             f"per regulatory obligations under MiCA Article 76 and FinCEN guidelines."
         )
-    elif risk["level"] == "HIGH":
+    elif level == "HIGH":
         exec_summary = (
-            f"This address presents **elevated compliance risk** with a score of {risk['score']}/100. "
+            f"This address presents **elevated compliance risk** with a score of {score}/100. "
             f"Multiple risk indicators have been identified that warrant enhanced due diligence (EDD) "
             f"and potential escalation to the compliance team for manual review."
         )
-    elif risk["level"] in ["MEDIUM", "MEDIUM-LOW"]:
+    elif level in ("MEDIUM", "MEDIUM-LOW"):
         exec_summary = (
-            f"This address presents **moderate compliance risk** with a score of {risk['score']}/100. "
+            f"This address presents **moderate compliance risk** with a score of {score}/100. "
             f"Some risk indicators have been identified but none reach critical thresholds. "
             f"Standard customer due diligence (CDD) with periodic monitoring is recommended."
         )
     else:
         exec_summary = (
-            f"This address presents **low compliance risk** with a score of {risk['score']}/100. "
+            f"This address presents **low compliance risk** with a score of {score}/100. "
             f"No sanctions exposure detected and transaction patterns appear consistent with normal "
             f"DeFi usage. Standard monitoring protocols are sufficient."
         )
 
     # Build findings section
-    findings_items = []
-    if sanctions:
-        for f in sanctions:
-            findings_items.append(f"- **SANCTIONS:** {f['description']}")
-    if patterns:
-        for f in patterns:
-            findings_items.append(f"- **{f['type'].upper()}:** {f['description']}")
+    findings_items: list[str] = []
+    for f in sanctions:
+        findings_items.append(f"- **SANCTIONS:** {f.get('description', '')}")
+    for f in patterns:
+        findings_items.append(
+            f"- **{(f.get('type') or 'finding').upper()}:** {f.get('description', '')}"
+        )
     if defi:
         protocol_list = ", ".join(defi.keys())
-        findings_items.append(f"- **DeFi Activity:** Interacts with {len(defi)} known protocol(s): {protocol_list}")
+        findings_items.append(
+            f"- **DeFi Activity:** Interacts with {len(defi)} known protocol(s): {protocol_list}"
+        )
     if not findings_items:
-        findings_items.append("- No notable risk indicators detected in the analyzed transaction set.")
-
+        findings_items.append(
+            "- No notable risk indicators detected in the analyzed transaction set."
+        )
     findings_text = "\n".join(findings_items)
 
     # Regulatory implications
-    reg_items = []
-    for reg in regs:
-        reg_items.append(f"- **{reg['name']}** (deadline: {reg['deadline']}): {reg['relevance']}")
-    reg_text = "\n".join(reg_items)
+    reg_items = [
+        f"- **{r.get('name','?')}** (deadline: {r.get('deadline','?')}): {r.get('relevance','')}"
+        for r in regs
+    ]
+    reg_text = "\n".join(reg_items) if reg_items else "- No specific regulations flagged."
 
     # Recommended actions based on risk level
-    if risk["level"] == "CRITICAL":
+    if level == "CRITICAL":
         actions = (
             "1. **Immediately escalate** to the Chief Compliance Officer (CCO)\n"
             "2. **Consider blocking** transactions with this address pending investigation\n"
@@ -180,7 +256,7 @@ def _generate_rule_based_narrative(analysis: dict) -> str:
             "4. **Document** all interactions with this address for regulatory records\n"
             "5. **Review** all other addresses that have transacted with this wallet"
         )
-    elif risk["level"] == "HIGH":
+    elif level == "HIGH":
         actions = (
             "1. **Initiate Enhanced Due Diligence (EDD)** on this address and its counterparties\n"
             "2. **Flag for ongoing monitoring** with increased frequency (daily vs. weekly)\n"
@@ -188,7 +264,7 @@ def _generate_rule_based_narrative(analysis: dict) -> str:
             "4. **Consider** whether a SAR filing threshold has been met\n"
             "5. **Document** risk assessment rationale in compliance records"
         )
-    elif risk["level"] in ["MEDIUM", "MEDIUM-LOW"]:
+    elif level in ("MEDIUM", "MEDIUM-LOW"):
         actions = (
             "1. **Continue standard CDD** monitoring at regular intervals\n"
             "2. **Note** flagged patterns in the address risk profile\n"
@@ -197,16 +273,16 @@ def _generate_rule_based_narrative(analysis: dict) -> str:
         )
     else:
         actions = (
-            "1. **Standard monitoring** -- no additional action required at this time\n"
+            "1. **Standard monitoring** - no additional action required at this time\n"
             "2. **Periodic re-scan** recommended (monthly or quarterly)\n"
             "3. **Archive** this report for compliance documentation purposes"
         )
 
-    report = f"""## Compliance Risk Assessment Report
+    return f"""## Compliance risk assessment (rule-based)
 
 **Address:** `{address}`
-**Report Generated:** {now}
-**Risk Score:** {risk['score']}/100 ({risk['level']})
+**Report generated:** {now}
+**Risk score:** {score}/100 ({level})
 
 ---
 
@@ -220,13 +296,13 @@ def _generate_rule_based_narrative(analysis: dict) -> str:
 
 | Metric | Value |
 |--------|-------|
-| ETH Balance | {stats['eth_balance']:.4f} ETH |
-| Total Transactions | {stats['total_transactions']} |
-| Token Transfers | {stats['total_token_transfers']} |
-| Unique Counterparties | {stats['unique_counterparties']} |
-| Address Age | {stats['address_age_days'] or 'Unknown'} days |
-| ETH Sent | {stats['total_eth_sent']} ETH |
-| ETH Received | {stats['total_eth_received']} ETH |
+| ETH Balance | {stats.get('eth_balance', 0):.4f} ETH |
+| Total Transactions | {stats.get('total_transactions', 0)} |
+| Token Transfers | {stats.get('total_token_transfers', 0)} |
+| Unique Counterparties | {stats.get('unique_counterparties', 0)} |
+| Address Age | {stats.get('address_age_days') or 'Unknown'} days |
+| ETH Sent | {stats.get('total_eth_sent', 0)} ETH |
+| ETH Received | {stats.get('total_eth_received', 0)} ETH |
 
 ---
 
@@ -248,6 +324,5 @@ def _generate_rule_based_narrative(analysis: dict) -> str:
 
 ---
 
-*This report was generated by an automated compliance scanning system. It should be reviewed by a qualified compliance professional before any enforcement actions are taken. Data sourced from Ethereum mainnet via Etherscan API.*
+*This report was generated by the rules-based fallback narrative engine. Set the ANTHROPIC_API_KEY environment variable to enable Claude-generated reports. All data sourced from live Ethereum mainnet.*
 """
-    return report
