@@ -380,6 +380,11 @@ code {
 .pill-high { background: color-mix(in srgb, var(--orange) 15%, transparent); color: var(--orange); }
 .pill-critical { background: color-mix(in srgb, var(--danger) 15%, transparent); color: var(--danger); }
 
+/* ---- Global hidden attribute -------------------------------------- */
+[hidden] {
+    display: none !important;
+}
+
 /* ---- Error banner --------------------------------------------------- */
 .error-banner {
     display: flex;
