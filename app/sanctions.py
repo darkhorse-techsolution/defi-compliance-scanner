@@ -401,9 +401,19 @@ async def is_address_sanctioned(address: str) -> bool:
     return address.lower() in sanctions
 
 
-async def check_chainalysis_oracle(address: str) -> bool:
+async def check_chainalysis_oracle(address: str) -> list[dict]:
     """
     Query the Chainalysis public sanctions API for a single address.
+
+    Returns a list of identification records. An empty list means the
+    address is clean. Each record has the shape::
+
+        {
+            "category": "sanctions" | "sanctioned entity" | ...,
+            "name":        str,
+            "description": str,
+            "url":         str,  # primary source citation
+        }
 
     As of 2026-04 Chainalysis requires an ``X-API-Key`` header on every
     request even for the free-tier sanctions oracle (5000 req / 5 min).
@@ -416,18 +426,19 @@ async def check_chainalysis_oracle(address: str) -> bool:
 
     api_key = os.getenv("CHAINALYSIS_API_KEY", "").strip()
     if not api_key or not address:
-        return False
+        return []
 
     url = _CHAINALYSIS_ORACLE_URL.format(address=address)
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.get(url, headers={"X-API-Key": api_key})
             if resp.status_code != 200:
-                return False
+                return []
             data = resp.json()
     except (httpx.HTTPError, ValueError):
-        return False
-    return bool(data.get("identifications"))
+        return []
+    identifications = data.get("identifications") or []
+    return identifications if isinstance(identifications, list) else []
 
 
 def chainalysis_oracle_available() -> bool:
@@ -439,27 +450,29 @@ def chainalysis_oracle_available() -> bool:
 async def batch_check_chainalysis_oracle(
     addresses: list[str],
     max_concurrent: int = 5,
-) -> set[str]:
+) -> dict[str, list[dict]]:
     """
     Run the Chainalysis oracle against a batch of addresses with a
-    bounded concurrency ceiling. Returns the set of addresses the
-    oracle marked as sanctioned.
+    bounded concurrency ceiling. Returns a dict keyed by address, with
+    the list of identification records as the value. Addresses not in
+    the dict are either clean or failed to look up.
 
-    This is intentionally capped - the oracle is free but shared, and
-    scanning every counterparty of a whale wallet would hammer it. The
+    This is intentionally capped - scanning every counterparty of a
+    whale wallet would burn through the 5k/5min free-tier budget. The
     caller should pre-filter to the highest-signal addresses (e.g. the
     top N counterparties by volume) before asking for a batch check.
     """
     if not addresses:
-        return set()
+        return {}
 
     semaphore = asyncio.Semaphore(max_concurrent)
-    hits: set[str] = set()
+    hits: dict[str, list[dict]] = {}
 
     async def _guarded(addr: str) -> None:
         async with semaphore:
-            if await check_chainalysis_oracle(addr):
-                hits.add(addr.lower())
+            identifications = await check_chainalysis_oracle(addr)
+            if identifications:
+                hits[addr.lower()] = identifications
 
     await asyncio.gather(*(_guarded(a) for a in addresses), return_exceptions=True)
     return hits

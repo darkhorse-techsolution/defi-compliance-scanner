@@ -72,7 +72,7 @@ async def _oracle_check_top_counterparties(
     address: str,
     wallet_data: dict,
     max_counterparties: int = 10,
-) -> set[str]:
+) -> dict[str, list[dict]]:
     """
     Hit the Chainalysis public sanctions oracle for (1) the scanned
     address itself and (2) the top N counterparties by transaction
@@ -80,7 +80,10 @@ async def _oracle_check_top_counterparties(
     the risk engine so they get flagged as full CRITICAL findings
     during analysis.
 
-    Returns the set of addresses the oracle confirmed as sanctioned.
+    Returns a dict mapping each sanctioned address to its list of
+    Chainalysis identification records. The identification data
+    (sanctioning body, designation date, source URL) is used to build
+    higher-quality sanctions findings in the report.
     """
     from app.sanctions import _SANCTIONS_CACHE  # local import to avoid cycle
 
@@ -106,18 +109,18 @@ async def _oracle_check_top_counterparties(
         logger.debug("counterparty extraction failed: %s", exc)
 
     if not candidates:
-        return set()
+        return {}
 
     try:
         hits = await batch_check_chainalysis_oracle(candidates, max_concurrent=5)
     except Exception as exc:  # noqa: BLE001
         logger.warning("chainalysis oracle batch check failed: %s", exc)
-        return set()
+        return {}
 
     if hits:
         # Merge the hits into the risk-engine-visible cache so the
         # synchronous screen_sanctions call picks them up on this scan.
-        _SANCTIONS_CACHE.update(hits)
+        _SANCTIONS_CACHE.update(hits.keys())
 
     return hits
 
@@ -222,13 +225,40 @@ async def scan_address(request: Request):
         # before the risk engine walks the transaction list, so an
         # address added between cache refreshes is still caught. This
         # is a no-op when no CHAINALYSIS_API_KEY is configured.
-        oracle_hits: set[str] = set()
+        oracle_hits: dict[str, list] = {}
         if chainalysis_oracle_available():
             oracle_hits = await _oracle_check_top_counterparties(address, wallet_data)
 
         analysis = run_risk_analysis(wallet_data)
         if oracle_hits:
-            analysis["oracle_hits"] = sorted(oracle_hits)
+            analysis["oracle_hits"] = {
+                addr: ids for addr, ids in oracle_hits.items()
+            }
+            # Surface the oracle-added hits as real CRITICAL findings
+            # that the UI can render alongside the on-chain findings.
+            for addr, identifications in oracle_hits.items():
+                for ident in identifications[:2]:  # cap per-address
+                    analysis.setdefault("sanctions_findings", []).append({
+                        "type": "chainalysis_oracle_hit",
+                        "severity": "CRITICAL",
+                        "description": (
+                            f"{ident.get('category', 'sanctions').upper()}: "
+                            f"{ident.get('name', 'Unnamed designation')} "
+                            f"({addr[:10]}...)"
+                        ),
+                        "risk_score": 100,
+                        "source_url": ident.get("url"),
+                    })
+            # Force the top-line risk level to CRITICAL if the oracle
+            # confirmed anything - even one true positive from a fresh
+            # sanctions designation outweighs the on-chain heuristics.
+            analysis["risk_score"]["level"] = "CRITICAL"
+            analysis["risk_score"]["score"] = 100
+            analysis["risk_score"]["recommendation"] = (
+                "Critical: Chainalysis sanctions oracle flagged this address "
+                "or one of its direct counterparties. Block immediately and "
+                "escalate to your compliance officer."
+            )
         narrative, narrative_source = await generate_ai_narrative(analysis)
         analysis["narrative"] = narrative
         analysis["narrative_source"] = narrative_source
