@@ -26,12 +26,14 @@
                     </span>
                     <span class="brand-text">
                         <span class="brand-title">ComplianceNode Scanner</span>
-                        <span class="brand-subtitle">Real-time on-chain risk assessment</span>
+                        <span class="brand-subtitle">Built by Marc Watters / ComplianceNode</span>
                     </span>
                 </a>
                 <nav class="header-nav">
-                    <a class="header-link" href="https://compliancenode-website.pages.dev" target="_blank" rel="noopener">Website</a>
+                    <a class="header-link" href="https://compliancenode-website.pages.dev" target="_blank" rel="noopener">Portfolio</a>
+                    <a class="header-link" href="https://github.com/darkhorse-techsolution/defi-compliance-scanner" target="_blank" rel="noopener">Source</a>
                     <a class="header-link" href="mailto:marc@compliancenode.io">Contact</a>
+                    <a class="header-cta" href="https://compliancenode-website.pages.dev" target="_blank" rel="noopener">Hire Marc</a>
                     <button id="themeToggle" class="theme-toggle" type="button" aria-label="Toggle color theme">
                         <span class="theme-toggle-icon" id="themeToggleIcon">Dark</span>
                     </button>
@@ -56,7 +58,7 @@
                                 type="text"
                                 id="addressInput"
                                 class="scan-input"
-                                placeholder="0x... paste an Ethereum wallet address"
+                                placeholder="Paste any Ethereum wallet address, e.g. 0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
                                 spellcheck="false"
                                 autocapitalize="off"
                                 autocorrect="off"
@@ -69,21 +71,21 @@
 
                         <fieldset class="depth-selector" aria-label="Scan depth">
                             <legend class="depth-selector-legend">Scan depth</legend>
-                            <label class="depth-option">
+                            <label class="depth-option" title="Last 200 transactions. Best for a fast read on a single wallet.">
                                 <input type="radio" name="depth" value="quick">
                                 <span class="depth-option-label">
                                     <span class="depth-option-title">Quick</span>
                                     <span class="depth-option-meta">200 txs</span>
                                 </span>
                             </label>
-                            <label class="depth-option">
+                            <label class="depth-option" title="Last 1,000 transactions. Default for most addresses.">
                                 <input type="radio" name="depth" value="standard" checked>
                                 <span class="depth-option-label">
                                     <span class="depth-option-title">Standard</span>
                                     <span class="depth-option-meta">1,000 txs</span>
                                 </span>
                             </label>
-                            <label class="depth-option">
+                            <label class="depth-option" title="Up to 5,000 transactions via block-range pagination. Slower but full pattern coverage.">
                                 <input type="radio" name="depth" value="deep">
                                 <span class="depth-option-label">
                                     <span class="depth-option-title">Deep</span>
@@ -92,13 +94,24 @@
                             </label>
                         </fieldset>
 
-                        <p class="scan-hint" id="scanHint">
-                            Tip: paste any 0x address. Below are well-known public wallets you can try.
-                        </p>
+                        <ul class="how-strip" aria-label="How a scan runs">
+                            <li><span class="how-strip-num">1</span><span class="how-strip-text"><strong>Scan</strong> on-chain history via Etherscan V2</span></li>
+                            <li><span class="how-strip-arrow" aria-hidden="true">&rarr;</span></li>
+                            <li><span class="how-strip-num">2</span><span class="how-strip-text"><strong>Analyze</strong> against OFAC and risk patterns</span></li>
+                            <li><span class="how-strip-arrow" aria-hidden="true">&rarr;</span></li>
+                            <li><span class="how-strip-num">3</span><span class="how-strip-text"><strong>Report</strong> with a CCO-ready memo</span></li>
+                        </ul>
                     </form>
 
-                    <div class="example-chips" id="exampleChips">
-                        <!-- populated by JS -->
+                    <div class="example-block">
+                        <p class="example-heading">Try one of these well-known wallets</p>
+                        <div class="example-chips" id="exampleChips">
+                            <!-- populated by JS -->
+                        </div>
+                    </div>
+
+                    <div class="status-pills" id="statusPills" hidden>
+                        <!-- populated by JS from /api/health -->
                     </div>
                 </div>
             </div>
@@ -116,16 +129,27 @@
         </div>
 
         <!-- ===================== LOADING SKELETON ===================== -->
-        <section class="container loading-skeleton" id="loadingSkeleton" hidden>
-            <div class="skeleton-card skeleton-large"></div>
-            <div class="skeleton-grid">
-                <div class="skeleton-card"></div>
-                <div class="skeleton-card"></div>
-                <div class="skeleton-card"></div>
-                <div class="skeleton-card"></div>
+        <section class="container loading-skeleton" id="loadingSkeleton" hidden aria-busy="true" aria-live="polite">
+            <div class="skeleton-risk">
+                <div class="skeleton-gauge"></div>
+                <div class="skeleton-risk-meta">
+                    <div class="skeleton-line skeleton-line-pill"></div>
+                    <div class="skeleton-line skeleton-line-headline"></div>
+                    <div class="skeleton-line skeleton-line-text"></div>
+                    <div class="skeleton-line skeleton-line-text-short"></div>
+                </div>
             </div>
-            <div class="skeleton-card skeleton-medium"></div>
-            <div class="skeleton-card skeleton-medium"></div>
+            <div class="skeleton-grid">
+                <div class="skeleton-card skeleton-stat"></div>
+                <div class="skeleton-card skeleton-stat"></div>
+                <div class="skeleton-card skeleton-stat"></div>
+                <div class="skeleton-card skeleton-stat"></div>
+            </div>
+            <div class="skeleton-twocol">
+                <div class="skeleton-card skeleton-chart"></div>
+                <div class="skeleton-card skeleton-reg"></div>
+            </div>
+            <p class="skeleton-status">Fetching on-chain history, screening counterparties, drafting report&hellip;</p>
         </section>
 
         <!-- ===================== RESULTS ===================== -->
@@ -157,7 +181,9 @@
                     </div>
                     <div class="risk-meta-row meta-secondary">
                         <span class="meta-tag" id="dataSourceTag">Source: blockscout</span>
+                        <span class="meta-tag" id="oracleTag" hidden>Chainalysis oracle: checked</span>
                         <span class="meta-tag" id="analyzedAtTag">Analyzed just now</span>
+                        <button class="ghost-button copy-url-btn" id="copyUrlBtn" type="button" title="Copy a shareable link to this scan">Copy report URL</button>
                     </div>
                 </div>
             </div>
@@ -287,15 +313,16 @@
             <div class="container footer-row">
                 <div class="footer-brand">
                     <strong>ComplianceNode Scanner</strong>
-                    <p>On-chain compliance data infrastructure for crypto firms.</p>
+                    <p>Built by Marc Watters. On-chain compliance data infrastructure for crypto firms, exchanges, and DeFi protocols.</p>
                     <p class="footer-powered" id="footerPowered">
                         Powered by live Ethereum data and the OFAC SDN list.
                     </p>
                 </div>
                 <div class="footer-links">
-                    <a href="https://compliancenode-website.pages.dev" target="_blank" rel="noopener">Built by ComplianceNode</a>
-                    <a href="mailto:marc@compliancenode.io">Report by Marc Watters</a>
-                    <span class="footer-disclaimer">Educational tool. Not financial or legal advice.</span>
+                    <a href="https://compliancenode-website.pages.dev" target="_blank" rel="noopener">ComplianceNode portfolio</a>
+                    <a href="https://github.com/darkhorse-techsolution/defi-compliance-scanner" target="_blank" rel="noopener">Source on GitHub</a>
+                    <a href="mailto:marc@compliancenode.io">Contact Marc</a>
+                    <span class="footer-disclaimer">Demo prototype for portfolio purposes. Not a substitute for licensed compliance tooling. Not financial or legal advice.</span>
                 </div>
             </div>
         </footer>

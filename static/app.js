@@ -22,17 +22,30 @@
         bindEvents();
         loadExampleAddresses();
         loadHealthStatus();
+        runHashAddress();
     });
+
+    // Allow deep-linking via #0xADDRESS so a copied report URL re-runs
+    // the same scan when opened.
+    function runHashAddress() {
+        const hash = (window.location.hash || "").replace(/^#/, "").trim();
+        if (/^0x[0-9a-fA-F]{40}$/.test(hash)) {
+            els.addressInput.value = hash;
+            // Defer so health/example calls don't race the first paint
+            setTimeout(scanAddress, 100);
+        }
+    }
 
     function cacheEls() {
         const ids = [
-            "scanForm", "addressInput", "scanButton", "scanHint",
-            "exampleChips", "errorBanner", "errorTitle", "errorMessage",
+            "scanForm", "addressInput", "scanButton",
+            "exampleChips", "statusPills",
+            "errorBanner", "errorTitle", "errorMessage",
             "loadingSkeleton", "resultsSection",
             "riskGaugeFill", "riskScoreNumber", "riskLevelPill",
             "riskFindingCount", "riskHeadline", "riskRecommendation",
             "addressDisplay", "copyAddressBtn",
-            "dataSourceTag", "analyzedAtTag",
+            "dataSourceTag", "oracleTag", "analyzedAtTag", "copyUrlBtn",
             "statTransactions", "statTransactionsSub",
             "statVolume", "statAge", "statAgeSub", "statCounterparties",
             "activityChart", "chartEmpty", "regList",
@@ -61,6 +74,17 @@
             if (!currentResults || !currentResults.narrative) return;
             copyText(currentResults.narrative, els.copyNarrativeBtn, "Copy report");
         });
+
+        if (els.copyUrlBtn) {
+            els.copyUrlBtn.addEventListener("click", function () {
+                if (!currentResults) return;
+                const url = window.location.origin + window.location.pathname +
+                    "#" + currentResults.address;
+                // Update the visible URL too so a refresh would re-run
+                try { history.replaceState(null, "", "#" + currentResults.address); } catch (e) { /* ignore */ }
+                copyText(url, els.copyUrlBtn, "Copy report URL");
+            });
+        }
     }
 
     // ---- Theme -----------------------------------------------------------
@@ -125,31 +149,77 @@
         return "pill-low";
     }
 
-    // ---- Health / footer "powered by" ------------------------------------
+    // ---- Health / footer "powered by" + status pills --------------------
+    let healthState = null;
+
     async function loadHealthStatus() {
         try {
             const resp = await fetch("/api/health");
             if (!resp.ok) return;
             const data = await resp.json();
-            if (!els.footerPowered) return;
+            healthState = data;
 
             const sanctionsSize = Number(data.sanctions_list_size || 0);
-            const source = data.data_source === "etherscan_v2"
+            const sourceLabel = data.data_source === "etherscan_v2"
                 ? "Etherscan V2"
                 : "Blockscout (free tier)";
-            const parts = [];
-            parts.push("On-chain data via " + source);
-            if (sanctionsSize > 0) {
-                parts.push(sanctionsSize.toLocaleString() +
-                    " addresses in the OFAC sanctions cache");
+
+            // Footer (compact one-liner, kept for cold scrollers)
+            if (els.footerPowered) {
+                const parts = ["On-chain data via " + sourceLabel];
+                if (sanctionsSize > 0) {
+                    parts.push(sanctionsSize.toLocaleString() +
+                        " addresses in the OFAC sanctions cache");
+                }
+                if (data.anthropic_api_key === "configured") {
+                    parts.push("Claude API enabled");
+                }
+                els.footerPowered.textContent = "Powered by: " + parts.join(" | ");
             }
-            if (data.anthropic_api_key === "configured") {
-                parts.push("Claude API enabled");
-            }
-            els.footerPowered.textContent = "Powered by: " + parts.join(" | ");
+
+            // Hero status pills - live trust signals at first glance
+            renderStatusPills(data, sanctionsSize, sourceLabel);
         } catch (e) {
             // non-fatal - just leave the default footer copy in place
         }
+    }
+
+    function renderStatusPills(data, sanctionsSize, sourceLabel) {
+        if (!els.statusPills) return;
+        const pills = [];
+
+        if (sanctionsSize > 0) {
+            pills.push({
+                dot: "ok",
+                text: sanctionsSize.toLocaleString() + " sanctioned addresses cached",
+            });
+        }
+
+        pills.push({
+            dot: "ok",
+            text: "Source: " + sourceLabel,
+        });
+
+        if (data.chainalysis_oracle === "enabled") {
+            pills.push({ dot: "ok", text: "Chainalysis oracle: enabled" });
+        } else {
+            pills.push({ dot: "muted", text: "Chainalysis oracle: off" });
+        }
+
+        if (data.anthropic_api_key === "configured") {
+            pills.push({ dot: "ok", text: "Claude narrative: enabled" });
+        } else {
+            pills.push({ dot: "muted", text: "Claude narrative: rule-based fallback" });
+        }
+
+        els.statusPills.innerHTML = pills.map(function (p) {
+            const dotClass = p.dot === "muted" ? "status-pill-dot dot-muted"
+                : p.dot === "warn" ? "status-pill-dot dot-warn"
+                : "status-pill-dot";
+            return '<span class="status-pill"><span class="' + dotClass +
+                '" aria-hidden="true"></span>' + escapeHtml(p.text) + "</span>";
+        }).join("");
+        els.statusPills.hidden = false;
     }
 
     function selectedDepth() {
@@ -266,10 +336,28 @@
 
         els.addressDisplay.textContent = truncateAddress(data.address);
 
-        const sourceLabel = data.data_source === "etherscan_v2"
-            ? "Source: Etherscan V2"
-            : "Source: Blockscout (free)";
-        els.dataSourceTag.textContent = sourceLabel;
+        const oracleEnabled = healthState && healthState.chainalysis_oracle === "enabled";
+        const sourceParts = [];
+        sourceParts.push(data.data_source === "etherscan_v2"
+            ? "Etherscan V2"
+            : "Blockscout (free)");
+        if (oracleEnabled) {
+            sourceParts.push("Chainalysis Oracle");
+        }
+        els.dataSourceTag.textContent = "via " + sourceParts.join(" + ");
+
+        if (els.oracleTag) {
+            const wasChecked = oracleEnabled;
+            const hadHits = data.oracle_hits && Object.keys(data.oracle_hits).length > 0;
+            if (wasChecked) {
+                els.oracleTag.hidden = false;
+                els.oracleTag.textContent = hadHits
+                    ? "Chainalysis oracle: HIT"
+                    : "Chainalysis oracle: clean";
+            } else {
+                els.oracleTag.hidden = true;
+            }
+        }
 
         const analyzed = new Date(data.analyzed_at);
         els.analyzedAtTag.textContent = "Analyzed " + analyzed.toLocaleString();
@@ -580,9 +668,12 @@
 
     function formatEth(n) {
         const v = Number(n) || 0;
+        if (v >= 1_000_000_000) return (v / 1_000_000_000).toFixed(2) + "B ETH";
         if (v >= 1_000_000) return (v / 1_000_000).toFixed(2) + "M ETH";
-        if (v >= 1_000) return (v / 1_000).toFixed(2) + "K ETH";
+        if (v >= 10_000) return Math.round(v).toLocaleString() + " ETH";
+        if (v >= 1_000) return v.toLocaleString(undefined, { maximumFractionDigits: 2 }) + " ETH";
         if (v >= 1) return v.toFixed(2) + " ETH";
+        if (v === 0) return "0 ETH";
         return v.toFixed(4) + " ETH";
     }
 
